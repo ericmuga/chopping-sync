@@ -189,25 +189,15 @@ const getGroupedChoppingLines = async (pool, choppings, productionDate) => {
 };
 
 /**
- * Create or get batch record for specific date/hour
+ * Create a new batch row for this run's snapshot of unsynced choppings.
+ *
+ * A batch represents a coherent group of choppings that were closed by the time
+ * a single cron tick ran. Choppings that began in one hour but closed in the
+ * next get picked up by a later tick and land in their own batch (with a fresh
+ * dailySeq), instead of being silently merged — or worse, dropped — into an
+ * already-created batch for the same (date, hour).
  */
-const getOrCreateBatch = async (pool, productionDate, productionHour) => {
-  // Check if batch already exists
-  const existingBatch = await pool.request()
-    .input('batchDate', sql.Date, productionDate)
-    .input('batchHour', sql.Int, productionHour)
-    .query(`
-      SELECT batch_id FROM [dbo].[wms_sync_batch]
-      WHERE batch_date = @batchDate AND batch_hour = @batchHour
-    `);
-  
-  if (existingBatch.recordset.length > 0) {
-    const batchId = existingBatch.recordset[0].batch_id;
-    logger.info(`Using existing batch ${batchId} for ${productionDate} hour ${productionHour}`);
-    return { batchId, isNew: false };
-  }
-  
-  // Get daily sequence number
+const createBatch = async (pool, productionDate, productionHour) => {
   const seqResult = await pool.request()
     .input('batchDate', sql.Date, productionDate)
     .query(`
@@ -215,10 +205,9 @@ const getOrCreateBatch = async (pool, productionDate, productionHour) => {
       FROM [dbo].[wms_sync_batch]
       WHERE batch_date = @batchDate
     `);
-  
+
   const dailySeq = seqResult.recordset[0].seq;
-  
-  // Create new batch
+
   const insertResult = await pool.request()
     .input('batchDate', sql.Date, productionDate)
     .input('batchHour', sql.Int, productionHour)
@@ -229,11 +218,38 @@ const getOrCreateBatch = async (pool, productionDate, productionHour) => {
       OUTPUT INSERTED.batch_id
       VALUES (@batchDate, @batchHour, @batchCycle, @status)
     `);
-  
+
   const batchId = insertResult.recordset[0].batch_id;
   logger.info(`Created batch ${batchId} for ${productionDate} hour ${productionHour} (seq: ${dailySeq})`);
-  
-  return { batchId, dailySeq, isNew: true };
+
+  return { batchId, dailySeq };
+};
+
+/**
+ * Mark choppings as synced into a batch so the next run won't pick them up
+ * again. Disambiguates by (chopping_id, created_at date) because chopping_id
+ * repeats daily.
+ */
+const markChoppingsSynced = async (pool, choppings, batchId) => {
+  if (!choppings.length) return;
+
+  for (const c of choppings) {
+    const createdDate = c.created_date instanceof Date
+      ? c.created_date.toISOString().split('T')[0]
+      : c.created_date;
+
+    await pool.request()
+      .input('choppingId', sql.NVarChar, c.chopping_id)
+      .input('createdDate', sql.Date, createdDate)
+      .input('batchId', sql.BigInt, batchId)
+      .query(`
+        UPDATE [dbo].[choppings]
+        SET sync_id = @batchId
+        WHERE chopping_id = @choppingId
+          AND CAST(created_at AS DATE) = @createdDate
+          AND sync_id IS NULL
+      `);
+  }
 };
 
 /**
@@ -782,18 +798,24 @@ export const runSync = async () => {
       logger.info(`Processing ${production_date} hour ${production_hour} (${chopping_count} choppings)`);
       
       const choppings = await getChoppingsForHour(pool, production_date, production_hour);
+      if (!choppings.length) continue;
+
       const { outputs, inputs } = await getGroupedChoppingLines(pool, choppings, production_date);
-      
-      const { batchId, dailySeq } = await getOrCreateBatch(pool, production_date, production_hour);
-      
-      const orders = buildProductionOrders(outputs, production_date, dailySeq);       
+
+      const { batchId, dailySeq } = await createBatch(pool, production_date, production_hour);
+
+      const orders = buildProductionOrders(outputs, production_date, dailySeq);
       const headersInserted = await insertProductionHeaders(pool, orders, batchId);
       const { outputLines, inputLines } = await insertProductionLines(pool, orders, inputs, batchId);
-      
+
       logger.info(`Batch ${batchId}: Inserted ${headersInserted} headers, ${outputLines} output lines, ${inputLines} input lines`);
-      
+
       // Generate P17 orders for qualifying P18 G-items
       await generateP17Orders(pool, batchId);
+
+      // Snapshot these choppings into this batch so the next tick doesn't
+      // regroup them. Late-arriving choppings get their own batch.
+      await markChoppingsSynced(pool, choppings, batchId);
     }
     
     return { success: true };
