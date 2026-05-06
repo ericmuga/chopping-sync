@@ -152,21 +152,22 @@ WHERE NOT EXISTS (
 
 
 -- remove duplicate item lines before calculating output (scoped choppings only)
+-- CTE must reference a single base table so DELETE FROM <cte> stays updatable;
+-- scope via subquery instead of JOIN.
 ;WITH DuplicateLines AS (
     SELECT
-        cl.[id],
+        [id],
         ROW_NUMBER() OVER (
             PARTITION BY
-                cl.[chopping_id],
-                cl.[item_code],
-                CAST(cl.[created_at] AS date)
-            ORDER BY cl.[id] ASC
+                [chopping_id],
+                [item_code],
+                CAST([created_at] AS date)
+            ORDER BY [id] ASC
         ) AS rn
-    FROM [calibra].[dbo].[chopping_lines] cl
-    INNER JOIN #ScopedChoppings s
-        ON s.[chopping_id] = cl.[chopping_id]
-    WHERE cl.[created_at] >= @WorkDate
-      AND cl.[created_at] < DATEADD(DAY, 1, @WorkDate)
+    FROM [calibra].[dbo].[chopping_lines]
+    WHERE [created_at] >= @WorkDate
+      AND [created_at] < DATEADD(DAY, 1, @WorkDate)
+      AND [chopping_id] IN (SELECT [chopping_id] FROM #ScopedChoppings)
 )
 DELETE FROM DuplicateLines
 WHERE rn > 1;
