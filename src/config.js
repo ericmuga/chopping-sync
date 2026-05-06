@@ -7,7 +7,7 @@ export const config = {
     user: process.env.WMS_DB_USER,
     password: process.env.WMS_DB_PASSWORD,
     port: parseInt(process.env.WMS_DB_PORT || '1433'),
-    requestTimeout: parseInt(process.env.WMS_DB_REQUEST_TIMEOUT_MS || '120000'),
+    requestTimeout: parseInt(process.env.WMS_DB_REQUEST_TIMEOUT_MS || '360000'),
     options: {
       encrypt: false,
       trustServerCertificate: true,
