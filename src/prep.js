@@ -1,0 +1,252 @@
+/**
+ * Daily chopping_lines prep
+ *
+ * Runs before each batching/sync cycle. Reconstructs water/intake item lines
+ * from template_lines, removes duplicates, and recomputes output lines for
+ * choppings created today that are status = 'i' and have been closed.
+ */
+
+import { logger } from './logger.js';
+import { sql } from './db.js';
+
+const PREP_SQL = `
+DECLARE @WorkDate date = @paramWorkDate;
+
+IF OBJECT_ID('tempdb..#WaterQuery') IS NOT NULL DROP TABLE #WaterQuery;
+IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL DROP TABLE #OutputItems;
+IF OBJECT_ID('tempdb..#ScopedChoppings') IS NOT NULL DROP TABLE #ScopedChoppings;
+
+-- Scope: choppings created on @WorkDate that are status = 'i' and closed.
+-- Everything else in this script joins on this set.
+SELECT chopping_id
+INTO #ScopedChoppings
+FROM [calibra].[dbo].[choppings]
+WHERE [status] = 'i'
+  AND [closed_by] IS NOT NULL
+  AND [created_at] >= @WorkDate
+  AND [created_at] < DATEADD(DAY, 1, @WorkDate);
+
+CREATE INDEX IX_ScopedChoppings_id ON #ScopedChoppings(chopping_id);
+
+;WITH WaterQueryRaw AS (
+    SELECT
+        a.[chopping_id],
+        b.[item_code],
+        CAST(b.[units_per_100] * 2 AS decimal(8,2)) AS [weight]
+    FROM [calibra].[dbo].[chopping_lines] AS a
+    INNER JOIN #ScopedChoppings AS s
+        ON s.[chopping_id] = a.[chopping_id]
+    INNER JOIN [calibra].[dbo].[template_lines] AS b
+        ON LEFT(a.[chopping_id], 7) = b.[template_no]
+       AND b.[main_product] = 'No'
+       AND b.[item_code] NOT IN (
+            'G1321','G1335','G1938','G1940','G1975','G1980','G2001','G2002',
+            'G2004','G2005','G2007','G2008','G2009','G2019','G2021','G2022',
+            'G2024','G2025','G2038','G2042','G2044','G2054','G2055','G2060',
+            'G2150','G2159','G2175','G2179','G2180','G2247','G5513','G5702',
+            'G5703','G5707'
+       )
+    WHERE
+        a.[created_at] >= @WorkDate
+        AND a.[created_at] < DATEADD(DAY, 1, @WorkDate)
+        AND (
+            LEFT(a.[item_code], 1) IN ('G','H')
+            OR b.[item_code] IN (
+                'G2103','G2107','G2109','G2110','G2111','G2113','G2114','G2115',
+                'G2116','G2117','G2118','G2119','G2120','G2121','G2122','G2123',
+                'G2125','G2126','G2127','G2128','G2129','G2130','G2131','G2132',
+                'G2133','G2137','G2139','G2140','G2141','G2142','G2143','G2145',
+                'G2146','G2147','G2148','G2151','G2157','G2158','G2162','G2165',
+                'G2166','G2167','G2172','G2173','G2174','G2176','D213021','G2181'
+            )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM [calibra].[dbo].[template_lines] AS c
+            WHERE LOWER(c.[type]) <> 'intake'
+              AND c.[item_code] = a.[item_code]
+        )
+
+    UNION
+
+    SELECT
+        a.[chopping_id],
+        b.[item_code],
+        CAST(b.[units_per_100] * 2 AS decimal(8,2)) AS [weight]
+    FROM [calibra].[dbo].[chopping_lines] AS a
+    INNER JOIN #ScopedChoppings AS s
+        ON s.[chopping_id] = a.[chopping_id]
+    INNER JOIN [calibra].[dbo].[template_lines] AS b
+        ON LEFT(a.[chopping_id], 7) = b.[template_no]
+       AND b.[main_product] = 'No'
+       AND b.[item_code] NOT IN (
+            'G1321','G1335','G1938','G1940','G1975','G1980','G2001','G2002',
+            'G2004','G2005','G2007','G2008','G2009','G2019','G2021','G2022',
+            'G2024','G2025','G2038','G2042','G2044','G2054','G2055','G2060',
+            'G2150','G2159','G2175','G2179','G2180','G2247','G5513','G5702',
+            'G5703','G5707'
+       )
+    WHERE
+        a.[created_at] >= @WorkDate
+        AND a.[created_at] < DATEADD(DAY, 1, @WorkDate)
+        AND b.[item_code] IN (
+            'G2103','G2107','G2109','G2110','G2111','G2113','G2114','G2115',
+            'G2116','G2117','G2118','G2119','G2120','G2121','G2122','G2123',
+            'G2125','G2126','G2127','G2128','G2129','G2130','G2131','G2132',
+            'G2133','G2137','G2139','G2140','G2141','G2142','G2143','G2145',
+            'G2146','G2147','G2148','G2151','G2157','G2158','G2162','G2165',
+            'G2166','G2167','G2172','G2173','G2174','G2176','D213021','G2181'
+        )
+)
+SELECT
+    [chopping_id],
+    [item_code],
+    MAX([weight]) AS [weight]
+INTO #WaterQuery
+FROM WaterQueryRaw
+GROUP BY
+    [chopping_id],
+    [item_code];
+
+
+-- update existing item lines for the work date
+UPDATE target
+SET
+    target.[weight] = source.[weight],
+    target.[updated_at] = GETDATE()
+FROM [calibra].[dbo].[chopping_lines] AS target
+INNER JOIN #WaterQuery AS source
+    ON target.[chopping_id] = source.[chopping_id]
+   AND target.[item_code] = source.[item_code]
+WHERE target.[created_at] >= @WorkDate
+  AND target.[created_at] < DATEADD(DAY, 1, @WorkDate);
+
+
+-- insert missing item lines for the work date
+INSERT INTO [calibra].[dbo].[chopping_lines] (
+    [chopping_id],
+    [item_code],
+    [weight],
+    [output],
+    [batch_no],
+    [created_at],
+    [updated_at]
+)
+SELECT
+    source.[chopping_id],
+    source.[item_code],
+    source.[weight],
+    0,
+    NULL,
+    GETDATE(),
+    GETDATE()
+FROM #WaterQuery AS source
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM [calibra].[dbo].[chopping_lines] AS target WITH (UPDLOCK, HOLDLOCK)
+    WHERE target.[chopping_id] = source.[chopping_id]
+      AND target.[item_code] = source.[item_code]
+      AND target.[created_at] >= @WorkDate
+      AND target.[created_at] < DATEADD(DAY, 1, @WorkDate)
+);
+
+
+-- remove duplicate item lines before calculating output (scoped choppings only)
+;WITH DuplicateLines AS (
+    SELECT
+        cl.[id],
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                cl.[chopping_id],
+                cl.[item_code],
+                CAST(cl.[created_at] AS date)
+            ORDER BY cl.[id] ASC
+        ) AS rn
+    FROM [calibra].[dbo].[chopping_lines] cl
+    INNER JOIN #ScopedChoppings s
+        ON s.[chopping_id] = cl.[chopping_id]
+    WHERE cl.[created_at] >= @WorkDate
+      AND cl.[created_at] < DATEADD(DAY, 1, @WorkDate)
+)
+DELETE FROM DuplicateLines
+WHERE rn > 1;
+
+
+-- build output lines after duplicates are removed
+SELECT
+    cl.[chopping_id],
+    tl.[item_code],
+    CAST(SUM(ISNULL(cl.[weight], 0)) AS decimal(8,2)) AS [weight]
+INTO #OutputItems
+FROM [calibra].[dbo].[chopping_lines] AS cl
+INNER JOIN #ScopedChoppings AS s
+    ON s.[chopping_id] = cl.[chopping_id]
+INNER JOIN [calibra].[dbo].[template_lines] AS tl
+    ON LEFT(cl.[chopping_id], 7) = tl.[template_no]
+   AND tl.[main_product] = 'Yes'
+   AND LOWER(tl.[type]) <> 'intake'
+WHERE
+    cl.[created_at] >= @WorkDate
+    AND cl.[created_at] < DATEADD(DAY, 1, @WorkDate)
+    AND cl.[item_code] NOT IN ('H221187', 'H221188')
+    AND cl.[item_code] <> tl.[item_code]
+GROUP BY
+    cl.[chopping_id],
+    tl.[item_code];
+
+
+-- update existing output line for the work date
+UPDATE target
+SET
+    target.[weight] = source.[weight],
+    target.[output] = 1,
+    target.[updated_at] = GETDATE()
+FROM [calibra].[dbo].[chopping_lines] AS target
+INNER JOIN #OutputItems AS source
+    ON target.[chopping_id] = source.[chopping_id]
+   AND target.[item_code] = source.[item_code]
+WHERE target.[created_at] >= @WorkDate
+  AND target.[created_at] < DATEADD(DAY, 1, @WorkDate);
+
+
+-- insert missing output line for the work date
+INSERT INTO [calibra].[dbo].[chopping_lines] (
+    [chopping_id],
+    [item_code],
+    [weight],
+    [output],
+    [batch_no],
+    [created_at],
+    [updated_at]
+)
+SELECT
+    source.[chopping_id],
+    source.[item_code],
+    source.[weight],
+    1,
+    NULL,
+    GETDATE(),
+    GETDATE()
+FROM #OutputItems AS source
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM [calibra].[dbo].[chopping_lines] AS target WITH (UPDLOCK, HOLDLOCK)
+    WHERE target.[chopping_id] = source.[chopping_id]
+      AND target.[item_code] = source.[item_code]
+      AND target.[created_at] >= @WorkDate
+      AND target.[created_at] < DATEADD(DAY, 1, @WorkDate)
+);
+`;
+
+export const prepChoppingLines = async (pool, workDate = null) => {
+  const date = workDate ?? new Date();
+  const dateStr = date.toISOString().split('T')[0];
+
+  logger.info(`Running chopping_lines prep for ${dateStr}`);
+
+  await pool.request()
+    .input('paramWorkDate', sql.Date, date)
+    .query(PREP_SQL);
+
+  logger.info(`Chopping_lines prep complete for ${dateStr}`);
+};

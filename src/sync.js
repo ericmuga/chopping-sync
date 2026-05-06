@@ -10,6 +10,7 @@
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { connectWms, sql } from './db.js';
+import { prepChoppingLines } from './prep.js';
 import {
   mapItemCode,
   getLocationCode,
@@ -789,9 +790,11 @@ export const runSync = async () => {
   const pool = await connectWms();
   
   try {
+    await prepChoppingLines(pool);
+
     await loadItemMappings(pool);
     await loadItemLocations(pool);
-    
+
     const hoursToProcess = await getHoursToProcess(pool);
     
     for (const { production_date, production_hour, chopping_count } of hoursToProcess) {
