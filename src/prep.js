@@ -3,7 +3,7 @@
  *
  * Runs before each batching/sync cycle. Reconstructs water/intake item lines
  * from template_lines, removes duplicates, and recomputes output lines for
- * choppings created today that are status = 'i' and have been closed.
+ * choppings created today that are status = 1 and have been closed.
  */
 
 import { logger } from './logger.js';
@@ -16,12 +16,12 @@ IF OBJECT_ID('tempdb..#WaterQuery') IS NOT NULL DROP TABLE #WaterQuery;
 IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL DROP TABLE #OutputItems;
 IF OBJECT_ID('tempdb..#ScopedChoppings') IS NOT NULL DROP TABLE #ScopedChoppings;
 
--- Scope: choppings created on @WorkDate that are status = 'i' and closed.
+-- Scope: choppings created on @WorkDate that are status = 1 and closed.
 -- Everything else in this script joins on this set.
 SELECT chopping_id
 INTO #ScopedChoppings
 FROM [calibra].[dbo].[choppings]
-WHERE [status] = 'i'
+WHERE [status] = 1
   AND [closed_by] IS NOT NULL
   AND [created_at] >= @WorkDate
   AND [created_at] < DATEADD(DAY, 1, @WorkDate);
