@@ -190,67 +190,85 @@ const getGroupedChoppingLines = async (pool, choppings, productionDate) => {
 };
 
 /**
- * Create a new batch row for this run's snapshot of unsynced choppings.
+ * Reuse the batch row for a (date, hour) if one already exists, otherwise
+ * create one. The schema enforces UQ_batch_date_hour, so each (date, hour)
+ * has exactly one batch — late-arriving choppings re-aggregate into the
+ * existing batch on a subsequent tick.
  *
- * A batch represents a coherent group of choppings that were closed by the time
- * a single cron tick ran. Choppings that began in one hour but closed in the
- * next get picked up by a later tick and land in their own batch (with a fresh
- * dailySeq), instead of being silently merged — or worse, dropped — into an
- * already-created batch for the same (date, hour).
+ * Returns dailySeq computed as this batch's rank (by batch_id ASC) within the
+ * date, so the production_order_no suffix stays stable across reuses. A
+ * concurrent tick can race us on INSERT; we catch the unique-key violation,
+ * read the row the other tick just wrote, and continue.
  */
-const createBatch = async (pool, productionDate, productionHour) => {
-  const seqResult = await pool.request()
-    .input('batchDate', sql.Date, productionDate)
-    .query(`
-      SELECT COUNT(*) + 1 AS seq
-      FROM [dbo].[wms_sync_batch]
-      WHERE batch_date = @batchDate
-    `);
-
-  const dailySeq = seqResult.recordset[0].seq;
-
-  const insertResult = await pool.request()
+const getOrCreateBatch = async (pool, productionDate, productionHour) => {
+  const existing = await pool.request()
     .input('batchDate', sql.Date, productionDate)
     .input('batchHour', sql.Int, productionHour)
-    .input('batchCycle', sql.Int, 1)
-    .input('status', sql.TinyInt, 0)
     .query(`
-      INSERT INTO [dbo].[wms_sync_batch] (batch_date, batch_hour, batch_cycle, status)
-      OUTPUT INSERTED.batch_id
-      VALUES (@batchDate, @batchHour, @batchCycle, @status)
+      SELECT batch_id FROM [dbo].[wms_sync_batch]
+      WHERE batch_date = @batchDate AND batch_hour = @batchHour
     `);
 
-  const batchId = insertResult.recordset[0].batch_id;
-  logger.info(`Created batch ${batchId} for ${productionDate} hour ${productionHour} (seq: ${dailySeq})`);
+  if (existing.recordset.length > 0) {
+    const batchId = existing.recordset[0].batch_id;
+    const dailySeq = await getBatchDailySeq(pool, productionDate, batchId);
+    logger.info(`Using existing batch ${batchId} for ${productionDate} hour ${productionHour} (seq: ${dailySeq})`);
+    return { batchId, dailySeq, isNew: false };
+  }
 
-  return { batchId, dailySeq };
+  try {
+    const insertResult = await pool.request()
+      .input('batchDate', sql.Date, productionDate)
+      .input('batchHour', sql.Int, productionHour)
+      .input('batchCycle', sql.Int, 1)
+      .input('status', sql.TinyInt, 0)
+      .query(`
+        INSERT INTO [dbo].[wms_sync_batch] (batch_date, batch_hour, batch_cycle, status)
+        OUTPUT INSERTED.batch_id
+        VALUES (@batchDate, @batchHour, @batchCycle, @status)
+      `);
+
+    const batchId = insertResult.recordset[0].batch_id;
+    const dailySeq = await getBatchDailySeq(pool, productionDate, batchId);
+    logger.info(`Created batch ${batchId} for ${productionDate} hour ${productionHour} (seq: ${dailySeq})`);
+    return { batchId, dailySeq, isNew: true };
+  } catch (err) {
+    // 2627 = UNIQUE KEY violation, 2601 = unique index. A concurrent tick beat us
+    // to the INSERT — read the row it wrote and continue.
+    if (err.number === 2627 || err.number === 2601) {
+      logger.warn(
+        `Concurrent insert on wms_sync_batch for batch_date=${productionDate}, batch_hour=${productionHour}: ${err.message}. Reading the row written by the other tick.`
+      );
+      const retry = await pool.request()
+        .input('batchDate', sql.Date, productionDate)
+        .input('batchHour', sql.Int, productionHour)
+        .query(`
+          SELECT batch_id FROM [dbo].[wms_sync_batch]
+          WHERE batch_date = @batchDate AND batch_hour = @batchHour
+        `);
+      if (retry.recordset.length > 0) {
+        const batchId = retry.recordset[0].batch_id;
+        const dailySeq = await getBatchDailySeq(pool, productionDate, batchId);
+        return { batchId, dailySeq, isNew: false };
+      }
+    }
+    logger.error(
+      `Failed to create batch (batch_date=${productionDate}, batch_hour=${productionHour}, batch_cycle=1, status=0): ${err.message}`
+    );
+    throw err;
+  }
 };
 
-/**
- * Mark choppings as synced into a batch so the next run won't pick them up
- * again. Disambiguates by (chopping_id, created_at date) because chopping_id
- * repeats daily.
- */
-const markChoppingsSynced = async (pool, choppings, batchId) => {
-  if (!choppings.length) return;
-
-  for (const c of choppings) {
-    const createdDate = c.created_date instanceof Date
-      ? c.created_date.toISOString().split('T')[0]
-      : c.created_date;
-
-    await pool.request()
-      .input('choppingId', sql.NVarChar, c.chopping_id)
-      .input('createdDate', sql.Date, createdDate)
-      .input('batchId', sql.BigInt, batchId)
-      .query(`
-        UPDATE [dbo].[choppings]
-        SET sync_id = @batchId
-        WHERE chopping_id = @choppingId
-          AND CAST(created_at AS DATE) = @createdDate
-          AND sync_id IS NULL
-      `);
-  }
+const getBatchDailySeq = async (pool, productionDate, batchId) => {
+  const result = await pool.request()
+    .input('batchDate', sql.Date, productionDate)
+    .input('batchId', sql.BigInt, batchId)
+    .query(`
+      SELECT COUNT(*) AS seq
+      FROM [dbo].[wms_sync_batch]
+      WHERE batch_date = @batchDate AND batch_id <= @batchId
+    `);
+  return result.recordset[0].seq;
 };
 
 /**
@@ -322,10 +340,15 @@ const insertProductionHeaders = async (pool, orders, batchId) => {
       
       inserted++;
     } catch (err) {
-      logger.error(`Failed to insert header ${order.productionOrderNo}: ${err.message}`);
+      logger.error(
+        `Failed to insert header ${order.productionOrderNo} ` +
+        `(batchId=${batchId}, itemNo=${order.outputItem}, qty=${order.outputWeight}, ` +
+        `locationCode=${locationCode}, productionDate=${order.productionDate}, ` +
+        `recipePrefix=${order.recipePrefix}): ${err.message}`
+      );
     }
   }
-  
+
   return inserted;
 };
 
@@ -379,7 +402,11 @@ const insertProductionLines = async (pool, orders, inputs, batchId) => {
       
       outputLines++;
     } catch (err) {
-      logger.error(`Failed to insert output line ${order.productionOrderNo}: ${err.message}`);
+      logger.error(
+        `Failed to insert output line ${order.productionOrderNo}/1000 ` +
+        `(batchId=${batchId}, itemNo=${order.outputItem}, qty=${order.outputWeight}, ` +
+        `locationCode=${locationCode}, productionDate=${order.productionDate}): ${err.message}`
+      );
     }
   }
   
@@ -458,7 +485,11 @@ const insertProductionLines = async (pool, orders, inputs, batchId) => {
         inputLines++;
         lineNo += 1000;
       } catch (err) {
-        logger.error(`Failed to insert input line ${productionOrderNo}/${lineNo}: ${err.message}`);
+        logger.error(
+          `Failed to insert input line ${productionOrderNo}/${lineNo} ` +
+          `(batchId=${batchId}, itemNo=${input.itemCode}, qty=${input.totalWeight}, ` +
+          `locationCode=${locationCode}, productionDate=${input.productionDate}): ${err.message}`
+        );
       }
     }
   }
@@ -778,7 +809,11 @@ const generateP17Orders = async (pool, batchId) => {
 
       logger.debug(`Created P17 ${p17OrderNo} with ${ingredients.length} ingredient rows`);
     } catch (err) {
-      logger.error(`Failed to create P17 for ${row.production_order_no}/${row.item_no}: ${err.message}`);
+      logger.error(
+        `Failed to create P17 for ${row.production_order_no}/${row.item_no} ` +
+        `(batchId=${batchId}, p17OrderNo=${p17OrderNo}, qty=${row.quantity}, ` +
+        `locationCode=${row.location_code}, productionDate=${row.production_date}): ${err.message}`
+      );
     }
   }
 
@@ -805,7 +840,7 @@ export const runSync = async () => {
 
       const { outputs, inputs } = await getGroupedChoppingLines(pool, choppings, production_date);
 
-      const { batchId, dailySeq } = await createBatch(pool, production_date, production_hour);
+      const { batchId, dailySeq } = await getOrCreateBatch(pool, production_date, production_hour);
 
       const orders = buildProductionOrders(outputs, production_date, dailySeq);
       const headersInserted = await insertProductionHeaders(pool, orders, batchId);
@@ -815,10 +850,6 @@ export const runSync = async () => {
 
       // Generate P17 orders for qualifying P18 G-items
       await generateP17Orders(pool, batchId);
-
-      // Snapshot these choppings into this batch so the next tick doesn't
-      // regroup them. Late-arriving choppings get their own batch.
-      await markChoppingsSynced(pool, choppings, batchId);
     }
     
     return { success: true };

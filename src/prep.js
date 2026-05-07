@@ -12,21 +12,12 @@ import { sql } from './db.js';
 const PREP_SQL = `
 DECLARE @WorkDate date = @paramWorkDate;
 
-IF OBJECT_ID('tempdb..#WaterQuery') IS NOT NULL DROP TABLE #WaterQuery;
-IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL DROP TABLE #OutputItems;
-IF OBJECT_ID('tempdb..#ScopedChoppings') IS NOT NULL DROP TABLE #ScopedChoppings;
+IF OBJECT_ID('tempdb..#WaterQuery') IS NOT NULL
+    DROP TABLE #WaterQuery;
 
--- Scope: choppings created on @WorkDate that are status = 1 and closed.
--- Everything else in this script joins on this set.
-SELECT chopping_id
-INTO #ScopedChoppings
-FROM [calibra].[dbo].[choppings]
-WHERE [status] = 1
-  AND [closed_by] IS NOT NULL
-  AND [created_at] >= @WorkDate
-  AND [created_at] < DATEADD(DAY, 1, @WorkDate);
+IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL
+    DROP TABLE #OutputItems;
 
-CREATE INDEX IX_ScopedChoppings_id ON #ScopedChoppings(chopping_id);
 
 ;WITH WaterQueryRaw AS (
     SELECT
@@ -34,8 +25,6 @@ CREATE INDEX IX_ScopedChoppings_id ON #ScopedChoppings(chopping_id);
         b.[item_code],
         CAST(b.[units_per_100] * 2 AS decimal(8,2)) AS [weight]
     FROM [calibra].[dbo].[chopping_lines] AS a
-    INNER JOIN #ScopedChoppings AS s
-        ON s.[chopping_id] = a.[chopping_id]
     INNER JOIN [calibra].[dbo].[template_lines] AS b
         ON LEFT(a.[chopping_id], 7) = b.[template_no]
        AND b.[main_product] = 'No'
@@ -44,7 +33,7 @@ CREATE INDEX IX_ScopedChoppings_id ON #ScopedChoppings(chopping_id);
             'G2004','G2005','G2007','G2008','G2009','G2019','G2021','G2022',
             'G2024','G2025','G2038','G2042','G2044','G2054','G2055','G2060',
             'G2150','G2159','G2175','G2179','G2180','G2247','G5513','G5702',
-            'G5703','G5707'
+            'G5703','G5707','G2061'
        )
     WHERE
         a.[created_at] >= @WorkDate
@@ -74,8 +63,6 @@ CREATE INDEX IX_ScopedChoppings_id ON #ScopedChoppings(chopping_id);
         b.[item_code],
         CAST(b.[units_per_100] * 2 AS decimal(8,2)) AS [weight]
     FROM [calibra].[dbo].[chopping_lines] AS a
-    INNER JOIN #ScopedChoppings AS s
-        ON s.[chopping_id] = a.[chopping_id]
     INNER JOIN [calibra].[dbo].[template_lines] AS b
         ON LEFT(a.[chopping_id], 7) = b.[template_no]
        AND b.[main_product] = 'No'
@@ -84,7 +71,7 @@ CREATE INDEX IX_ScopedChoppings_id ON #ScopedChoppings(chopping_id);
             'G2004','G2005','G2007','G2008','G2009','G2019','G2021','G2022',
             'G2024','G2025','G2038','G2042','G2044','G2054','G2055','G2060',
             'G2150','G2159','G2175','G2179','G2180','G2247','G5513','G5702',
-            'G5703','G5707'
+            'G5703','G5707','G2061'
        )
     WHERE
         a.[created_at] >= @WorkDate
@@ -151,9 +138,7 @@ WHERE NOT EXISTS (
 );
 
 
--- remove duplicate item lines before calculating output (scoped choppings only)
--- CTE must reference a single base table so DELETE FROM <cte> stays updatable;
--- scope via subquery instead of JOIN.
+-- remove duplicate item lines before calculating output
 ;WITH DuplicateLines AS (
     SELECT
         [id],
@@ -167,7 +152,6 @@ WHERE NOT EXISTS (
     FROM [calibra].[dbo].[chopping_lines]
     WHERE [created_at] >= @WorkDate
       AND [created_at] < DATEADD(DAY, 1, @WorkDate)
-      AND [chopping_id] IN (SELECT [chopping_id] FROM #ScopedChoppings)
 )
 DELETE FROM DuplicateLines
 WHERE rn > 1;
@@ -180,8 +164,6 @@ SELECT
     CAST(SUM(ISNULL(cl.[weight], 0)) AS decimal(8,2)) AS [weight]
 INTO #OutputItems
 FROM [calibra].[dbo].[chopping_lines] AS cl
-INNER JOIN #ScopedChoppings AS s
-    ON s.[chopping_id] = cl.[chopping_id]
 INNER JOIN [calibra].[dbo].[template_lines] AS tl
     ON LEFT(cl.[chopping_id], 7) = tl.[template_no]
    AND tl.[main_product] = 'Yes'
