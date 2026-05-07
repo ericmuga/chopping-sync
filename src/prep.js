@@ -3,7 +3,9 @@
  *
  * Runs before each batching/sync cycle. Reconstructs water/intake item lines
  * from template_lines, removes duplicates, and recomputes output lines for
- * choppings created today that are status = 1 and have been closed.
+ * choppings created from @paramWorkDate onwards (default: yesterday). The
+ * yesterday default catches choppings that began the previous day and only
+ * closed/finished after midnight.
  */
 
 import { logger } from './logger.js';
@@ -37,7 +39,6 @@ IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL
        )
     WHERE
         a.[created_at] >= @WorkDate
-        AND a.[created_at] < DATEADD(DAY, 1, @WorkDate)
         AND (
             LEFT(a.[item_code], 1) IN ('G','H')
             OR b.[item_code] IN (
@@ -75,7 +76,6 @@ IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL
        )
     WHERE
         a.[created_at] >= @WorkDate
-        AND a.[created_at] < DATEADD(DAY, 1, @WorkDate)
         AND b.[item_code] IN (
             'G2103','G2107','G2109','G2110','G2111','G2113','G2114','G2115',
             'G2116','G2117','G2118','G2119','G2120','G2121','G2122','G2123',
@@ -105,8 +105,7 @@ FROM [calibra].[dbo].[chopping_lines] AS target
 INNER JOIN #WaterQuery AS source
     ON target.[chopping_id] = source.[chopping_id]
    AND target.[item_code] = source.[item_code]
-WHERE target.[created_at] >= @WorkDate
-  AND target.[created_at] < DATEADD(DAY, 1, @WorkDate);
+WHERE target.[created_at] >= @WorkDate;
 
 
 -- insert missing item lines for the work date
@@ -134,7 +133,6 @@ WHERE NOT EXISTS (
     WHERE target.[chopping_id] = source.[chopping_id]
       AND target.[item_code] = source.[item_code]
       AND target.[created_at] >= @WorkDate
-      AND target.[created_at] < DATEADD(DAY, 1, @WorkDate)
 );
 
 
@@ -151,7 +149,6 @@ WHERE NOT EXISTS (
         ) AS rn
     FROM [calibra].[dbo].[chopping_lines]
     WHERE [created_at] >= @WorkDate
-      AND [created_at] < DATEADD(DAY, 1, @WorkDate)
 )
 DELETE FROM DuplicateLines
 WHERE rn > 1;
@@ -170,7 +167,6 @@ INNER JOIN [calibra].[dbo].[template_lines] AS tl
    AND LOWER(tl.[type]) <> 'intake'
 WHERE
     cl.[created_at] >= @WorkDate
-    AND cl.[created_at] < DATEADD(DAY, 1, @WorkDate)
     AND cl.[item_code] NOT IN ('H221187', 'H221188')
     AND cl.[item_code] <> tl.[item_code]
 GROUP BY
@@ -188,8 +184,7 @@ FROM [calibra].[dbo].[chopping_lines] AS target
 INNER JOIN #OutputItems AS source
     ON target.[chopping_id] = source.[chopping_id]
    AND target.[item_code] = source.[item_code]
-WHERE target.[created_at] >= @WorkDate
-  AND target.[created_at] < DATEADD(DAY, 1, @WorkDate);
+WHERE target.[created_at] >= @WorkDate;
 
 
 -- insert missing output line for the work date
@@ -217,19 +212,28 @@ WHERE NOT EXISTS (
     WHERE target.[chopping_id] = source.[chopping_id]
       AND target.[item_code] = source.[item_code]
       AND target.[created_at] >= @WorkDate
-      AND target.[created_at] < DATEADD(DAY, 1, @WorkDate)
 );
 `;
 
 export const prepChoppingLines = async (pool, workDate = null) => {
-  const date = workDate ?? new Date();
+  // Default: yesterday at 00:00 — covers choppings that opened yesterday and
+  // only closed past midnight, plus everything that has happened since.
+  // Caller can pass an explicit earlier date to widen the window further.
+  let date;
+  if (workDate) {
+    date = workDate instanceof Date ? workDate : new Date(workDate);
+  } else {
+    date = new Date();
+    date.setDate(date.getDate() - 1);
+    date.setHours(0, 0, 0, 0);
+  }
   const dateStr = date.toISOString().split('T')[0];
 
-  logger.info(`Running chopping_lines prep for ${dateStr}`);
+  logger.info(`Running chopping_lines prep from ${dateStr} onwards`);
 
   await pool.request()
     .input('paramWorkDate', sql.Date, date)
     .query(PREP_SQL);
 
-  logger.info(`Chopping_lines prep complete for ${dateStr}`);
+  logger.info(`Chopping_lines prep complete (from ${dateStr} onwards)`);
 };
