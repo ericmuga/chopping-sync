@@ -20,6 +20,19 @@ IF OBJECT_ID('tempdb..#WaterQuery') IS NOT NULL
 IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL
     DROP TABLE #OutputItems;
 
+IF OBJECT_ID('tempdb..#ClosedChoppings') IS NOT NULL
+    DROP TABLE #ClosedChoppings;
+
+
+-- First, get all closed choppings for the work date (performance optimization)
+SELECT DISTINCT [chopping_id]
+INTO #ClosedChoppings
+FROM [calibra].[dbo].[choppings]
+WHERE [created_at] >= @WorkDate
+  AND [closed_by] IS NOT NULL;
+
+CREATE CLUSTERED INDEX IX_ClosedChoppings_ID ON #ClosedChoppings([chopping_id]);
+
 
 ;WITH WaterQueryRaw AS (
     SELECT
@@ -27,6 +40,8 @@ IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL
         b.[item_code],
         CAST(b.[units_per_100] * 2 AS decimal(8,2)) AS [weight]
     FROM [calibra].[dbo].[chopping_lines] AS a
+    INNER JOIN #ClosedChoppings AS cc
+        ON a.[chopping_id] = cc.[chopping_id]
     INNER JOIN [calibra].[dbo].[template_lines] AS b
         ON LEFT(a.[chopping_id], 7) = b.[template_no]
        AND b.[main_product] = 'No'
@@ -64,6 +79,8 @@ IF OBJECT_ID('tempdb..#OutputItems') IS NOT NULL
         b.[item_code],
         CAST(b.[units_per_100] * 2 AS decimal(8,2)) AS [weight]
     FROM [calibra].[dbo].[chopping_lines] AS a
+    INNER JOIN #ClosedChoppings AS cc
+        ON a.[chopping_id] = cc.[chopping_id]
     INNER JOIN [calibra].[dbo].[template_lines] AS b
         ON LEFT(a.[chopping_id], 7) = b.[template_no]
        AND b.[main_product] = 'No'
@@ -95,6 +112,8 @@ GROUP BY
     [chopping_id],
     [item_code];
 
+CREATE CLUSTERED INDEX IX_WaterQuery_ChoppingItem ON #WaterQuery([chopping_id], [item_code]);
+
 
 -- update existing item lines for the work date
 UPDATE target
@@ -102,6 +121,8 @@ SET
     target.[weight] = source.[weight],
     target.[updated_at] = GETDATE()
 FROM [calibra].[dbo].[chopping_lines] AS target
+INNER JOIN #ClosedChoppings AS cc
+    ON target.[chopping_id] = cc.[chopping_id]
 INNER JOIN #WaterQuery AS source
     ON target.[chopping_id] = source.[chopping_id]
    AND target.[item_code] = source.[item_code]
@@ -127,6 +148,8 @@ SELECT
     GETDATE(),
     GETDATE()
 FROM #WaterQuery AS source
+INNER JOIN #ClosedChoppings AS cc
+    ON source.[chopping_id] = cc.[chopping_id]
 WHERE NOT EXISTS (
     SELECT 1
     FROM [calibra].[dbo].[chopping_lines] AS target WITH (UPDLOCK, HOLDLOCK)
@@ -139,16 +162,18 @@ WHERE NOT EXISTS (
 -- remove duplicate item lines before calculating output
 ;WITH DuplicateLines AS (
     SELECT
-        [id],
+        cl.[id],
         ROW_NUMBER() OVER (
             PARTITION BY
-                [chopping_id],
-                [item_code],
-                CAST([created_at] AS date)
-            ORDER BY [id] ASC
+                cl.[chopping_id],
+                cl.[item_code],
+                CAST(cl.[created_at] AS date)
+            ORDER BY cl.[id] ASC
         ) AS rn
-    FROM [calibra].[dbo].[chopping_lines]
-    WHERE [created_at] >= @WorkDate
+    FROM [calibra].[dbo].[chopping_lines] AS cl
+    INNER JOIN #ClosedChoppings AS cc
+        ON cl.[chopping_id] = cc.[chopping_id]
+    WHERE cl.[created_at] >= @WorkDate
 )
 DELETE FROM DuplicateLines
 WHERE rn > 1;
@@ -161,6 +186,8 @@ SELECT
     CAST(SUM(ISNULL(cl.[weight], 0)) AS decimal(8,2)) AS [weight]
 INTO #OutputItems
 FROM [calibra].[dbo].[chopping_lines] AS cl
+INNER JOIN #ClosedChoppings AS cc
+    ON cl.[chopping_id] = cc.[chopping_id]
 INNER JOIN [calibra].[dbo].[template_lines] AS tl
     ON LEFT(cl.[chopping_id], 7) = tl.[template_no]
    AND tl.[main_product] = 'Yes'
@@ -173,6 +200,8 @@ GROUP BY
     cl.[chopping_id],
     tl.[item_code];
 
+CREATE CLUSTERED INDEX IX_OutputItems_ChoppingItem ON #OutputItems([chopping_id], [item_code]);
+
 
 -- update existing output line for the work date
 UPDATE target
@@ -181,6 +210,8 @@ SET
     target.[output] = 1,
     target.[updated_at] = GETDATE()
 FROM [calibra].[dbo].[chopping_lines] AS target
+INNER JOIN #ClosedChoppings AS cc
+    ON target.[chopping_id] = cc.[chopping_id]
 INNER JOIN #OutputItems AS source
     ON target.[chopping_id] = source.[chopping_id]
    AND target.[item_code] = source.[item_code]
@@ -206,6 +237,8 @@ SELECT
     GETDATE(),
     GETDATE()
 FROM #OutputItems AS source
+INNER JOIN #ClosedChoppings AS cc
+    ON source.[chopping_id] = cc.[chopping_id]
 WHERE NOT EXISTS (
     SELECT 1
     FROM [calibra].[dbo].[chopping_lines] AS target WITH (UPDLOCK, HOLDLOCK)

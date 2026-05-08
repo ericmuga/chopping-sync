@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check F:/applications/chopping-sync/src/prep.js)",
+      "Bash(node --check F:/applications/chopping-sync/src/sync.js)",
+      "Bash(gh auth *)",
+      "PowerShell(gh auth *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(node --check F:/applications/chopping-sync/src/config.js)"
+    ]
+  }
+}
