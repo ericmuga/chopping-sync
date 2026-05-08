@@ -183,8 +183,12 @@ WHERE NOT EXISTS (
         ON cl.[chopping_id] = cc.[chopping_id]
     WHERE cl.[created_at] >= @WorkDate
 )
-DELETE FROM DuplicateLines
-WHERE rn > 1;
+DELETE FROM [calibra].[dbo].[chopping_lines]
+WHERE [id] IN (
+    SELECT [id] 
+    FROM DuplicateLines 
+    WHERE rn > 1
+);
 
 
 -- build output lines after duplicates are removed
