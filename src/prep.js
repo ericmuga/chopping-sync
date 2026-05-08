@@ -1,15 +1,23 @@
 /**
  * Daily chopping_lines prep
  *
- * Runs before each batching/sync cycle. Reconstructs water/intake item lines
- * from template_lines, removes duplicates, and recomputes output lines for
- * choppings created from @paramWorkDate onwards (default: yesterday). The
- * yesterday default catches choppings that began the previous day and only
- * closed/finished after midnight.
+ * Runs before each batching/sync cycle. Processes ALL CLOSED choppings from
+ * @paramWorkDate onwards (default: config.sync.startDate).
+ * 
+ * For each closed chopping, this:
+ * - Reconstructs water/intake item lines from template_lines
+ * - Updates existing water/intake lines with recalculated weights
+ * - Inserts missing water/intake lines
+ * - Removes duplicate lines
+ * - Deletes and recreates ALL output lines with fresh calculations
+ * 
+ * IMPORTANT: This retroactively fixes historical data from the start date forward.
+ * Only processes choppings where closed_by IS NOT NULL.
  */
 
 import { logger } from './logger.js';
 import { sql } from './db.js';
+import { config } from './config.js';
 
 const PREP_SQL = `
 DECLARE @WorkDate date = @paramWorkDate;
@@ -182,6 +190,7 @@ WHERE rn > 1;
 -- build output lines after duplicates are removed
 SELECT
     cl.[chopping_id],
+    CAST(cl.[created_at] AS date) AS [chopping_date],
     tl.[item_code],
     CAST(SUM(ISNULL(cl.[weight], 0)) AS decimal(8,2)) AS [weight]
 INTO #OutputItems
@@ -198,27 +207,26 @@ WHERE
     AND cl.[item_code] <> tl.[item_code]
 GROUP BY
     cl.[chopping_id],
+    CAST(cl.[created_at] AS date),
     tl.[item_code];
 
-CREATE CLUSTERED INDEX IX_OutputItems_ChoppingItem ON #OutputItems([chopping_id], [item_code]);
+CREATE CLUSTERED INDEX IX_OutputItems_ChoppingItem ON #OutputItems([chopping_id], [chopping_date], [item_code]);
 
 
--- update existing output line for the work date
-UPDATE target
-SET
-    target.[weight] = source.[weight],
-    target.[output] = 1,
-    target.[updated_at] = GETDATE()
+-- delete existing output lines for closed choppings before reinserting
+DELETE target
 FROM [calibra].[dbo].[chopping_lines] AS target
 INNER JOIN #ClosedChoppings AS cc
     ON target.[chopping_id] = cc.[chopping_id]
 INNER JOIN #OutputItems AS source
     ON target.[chopping_id] = source.[chopping_id]
+   AND CAST(target.[created_at] AS date) = source.[chopping_date]
    AND target.[item_code] = source.[item_code]
-WHERE target.[created_at] >= @WorkDate;
+WHERE target.[created_at] >= @WorkDate
+  AND target.[output] = 1;
 
 
--- insert missing output line for the work date
+-- insert output lines for closed choppings
 INSERT INTO [calibra].[dbo].[chopping_lines] (
     [chopping_id],
     [item_code],
@@ -234,31 +242,22 @@ SELECT
     source.[weight],
     1,
     NULL,
-    GETDATE(),
+    source.[chopping_date],
     GETDATE()
 FROM #OutputItems AS source
 INNER JOIN #ClosedChoppings AS cc
-    ON source.[chopping_id] = cc.[chopping_id]
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM [calibra].[dbo].[chopping_lines] AS target WITH (UPDLOCK, HOLDLOCK)
-    WHERE target.[chopping_id] = source.[chopping_id]
-      AND target.[item_code] = source.[item_code]
-      AND target.[created_at] >= @WorkDate
-);
+    ON source.[chopping_id] = cc.[chopping_id];
 `;
 
 export const prepChoppingLines = async (pool, workDate = null) => {
-  // Default: yesterday at 00:00 — covers choppings that opened yesterday and
-  // only closed past midnight, plus everything that has happened since.
-  // Caller can pass an explicit earlier date to widen the window further.
+  // Default: config.sync.startDate — processes and amends ALL closed choppings
+  // from the configured start date onwards. This retroactively fixes historical
+  // data each run. Caller can pass an explicit date to override.
   let date;
   if (workDate) {
     date = workDate instanceof Date ? workDate : new Date(workDate);
   } else {
-    date = new Date();
-    date.setDate(date.getDate() - 1);
-    date.setHours(0, 0, 0, 0);
+    date = new Date(config.sync.startDate);
   }
   const dateStr = date.toISOString().split('T')[0];
 
