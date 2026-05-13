@@ -7,7 +7,7 @@
  * - Only processes closed choppings: closed_by IS NOT NULL
  * - Normal run only processes choppings where sync_id IS NULL
  * - After successful processing, marks processed choppings with sync_id = batch_id
- * - Exports rerunTodaySync() to rebuild today's data, including choppings created yesterday but closed today
+ * - Exports rerunFromTodaySync() to rebuild from today onward, including choppings created yesterday but closed today
  */
 
 import { config } from './config.js';
@@ -29,13 +29,13 @@ const toSqlDateString = (value) => {
 };
 
 /**
- * Reset today's generated sync data.
+ * Reset generated sync data from today onward.
  * Includes:
- * - normal today choppings: created_at = today
- * - midnight/missed cases: created_at may be yesterday, updated_at = today
+ * - normal today/future choppings: created_at >= today
+ * - midnight/missed cases: created_at may be yesterday, updated_at >= today
  */
-const resetTodaySyncData = async (pool) => {
-  logger.warn('Resetting today sync data before rerun...');
+const resetFromTodaySyncData = async (pool) => {
+  logger.warn('Resetting sync data from today onward before rerun...');
 
   const transaction = new sql.Transaction(pool);
 
@@ -51,7 +51,7 @@ const resetTodaySyncData = async (pool) => {
       FROM [dbo].[wms_production_line] l
       INNER JOIN [dbo].[wms_sync_batch] b
         ON l.batch_id = b.batch_id
-      WHERE b.batch_date = @today;
+      WHERE b.batch_date >= @today;
     `);
 
     await request().query(`
@@ -61,14 +61,24 @@ const resetTodaySyncData = async (pool) => {
       FROM [dbo].[wms_production_header] h
       INNER JOIN [dbo].[wms_sync_batch] b
         ON h.batch_id = b.batch_id
-      WHERE b.batch_date = @today;
+      WHERE b.batch_date >= @today;
+    `);
+
+    await request().query(`
+      DECLARE @today DATE = CAST(GETDATE() AS DATE);
+
+      DELETE s
+      FROM [dbo].[wms_bc_sync_log] s
+      INNER JOIN [dbo].[wms_sync_batch] b
+        ON s.batch_id = b.batch_id
+      WHERE b.batch_date >= @today;
     `);
 
     await request().query(`
       DECLARE @today DATE = CAST(GETDATE() AS DATE);
 
       DELETE FROM [dbo].[wms_sync_batch]
-      WHERE batch_date = @today;
+      WHERE batch_date >= @today;
     `);
 
     const resetResult = await request().query(`
@@ -78,20 +88,20 @@ const resetTodaySyncData = async (pool) => {
       SET sync_id = NULL
       WHERE closed_by IS NOT NULL
         AND (
-          CAST(created_at AS DATE) = @today
-          OR CAST(updated_at AS DATE) = @today
+          CAST(created_at AS DATE) >= @today
+          OR CAST(updated_at AS DATE) >= @today
         );
     `);
 
     await transaction.commit();
 
     const rowsAffected = resetResult.rowsAffected?.[0] || 0;
-    logger.warn(`Reset ${rowsAffected} today choppings for rerun`);
+    logger.warn(`Reset ${rowsAffected} choppings from today onward for rerun`);
 
     return rowsAffected;
   } catch (err) {
     await transaction.rollback();
-    logger.error(`Failed to reset today sync data: ${err.message}`);
+    logger.error(`Failed to reset sync data from today onward: ${err.message}`);
     throw err;
   }
 };
@@ -994,6 +1004,9 @@ export const runSync = async () => {
   const pool = await connectWms();
 
   try {
+    // Rebuild and rerun from today onward
+    await resetFromTodaySyncData(pool);
+
     return await processPendingSync(pool);
   } catch (err) {
     logger.error('Error during sync:', err);
@@ -1002,23 +1015,8 @@ export const runSync = async () => {
 };
 
 /**
- * Full rebuild for today's production date.
- * Use this when you want to rerun all of today, including missed midnight cases.
+ * Full rebuild from today's production date onward.
+ * Use this when you want to rerun everything from today going forward,
+ * including missed midnight cases.
  */
-export const rerunTodaySync = async () => {
-  const pool = await connectWms();
 
-  try {
-    const resetChoppings = await resetTodaySyncData(pool);
-    const result = await processPendingSync(pool);
-
-    return {
-      ...result,
-      rerunToday: true,
-      resetChoppings,
-    };
-  } catch (err) {
-    logger.error('Error during today rerun sync:', err);
-    return { success: false, rerunToday: true, error: err };
-  }
-};
