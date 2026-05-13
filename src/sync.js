@@ -51,7 +51,6 @@ const getHoursToProcess = async (pool) => {
         END AS production_hour
       FROM [dbo].[choppings]
       WHERE closed_by IS NOT NULL
-        AND sync_id IS NULL
     ),
     Hours AS (
       SELECT DISTINCT production_date, production_hour
@@ -100,7 +99,6 @@ const getChoppingsForHour = async (pool, productionDate, productionHour) => {
         END AS production_hour
       FROM [dbo].[choppings]
       WHERE closed_by IS NOT NULL
-        AND sync_id IS NULL
         AND (
           -- Normal case: created and closed same day
           (CAST(updated_at AS DATE) = CAST(created_at AS DATE)
