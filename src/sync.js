@@ -1,10 +1,13 @@
 /**
  * WMS to Business Central Sync Service
- * 
+ *
  * Key features:
- * - Processes each hour separately (idempotent)
- * - Joins chopping_lines using BOTH chopping_id AND date (chopping_id repeats daily)
- * - Only processes closed choppings (closed_by IS NOT NULL)
+ * - Processes each hour separately
+ * - Joins chopping_lines using BOTH chopping_id AND created date because chopping_id repeats daily
+ * - Only processes closed choppings: closed_by IS NOT NULL
+ * - Normal run only processes choppings where sync_id IS NULL
+ * - After successful processing, marks processed choppings with sync_id = batch_id
+ * - Exports rerunTodaySync() to rebuild today's data, including choppings created yesterday but closed today
  */
 
 import { config } from './config.js';
@@ -15,148 +18,216 @@ import {
   mapItemCode,
   getLocationCode,
   getRecipePrefix,
-  getShortRecipeCode,
-  formatDateYYMMDD,
   buildProductionOrderNo,
   loadItemMappings,
   loadItemLocations,
 } from './helpers.js';
 
+const toSqlDateString = (value) => {
+  if (value instanceof Date) return value.toISOString().split('T')[0];
+  return String(value).split('T')[0];
+};
+
 /**
- * Get hours that need processing (from start date to now)
- * 
- * Edge case: If a chopping spans midnight (created on day N, closed on day N+1),
- * it goes into day N+1 hour 0 (batch 1 of the following day)
+ * Reset today's generated sync data.
+ * Includes:
+ * - normal today choppings: created_at = today
+ * - midnight/missed cases: created_at may be yesterday, updated_at = today
+ */
+const resetTodaySyncData = async (pool) => {
+  logger.warn('Resetting today sync data before rerun...');
+
+  const transaction = new sql.Transaction(pool);
+
+  try {
+    await transaction.begin();
+
+    const request = () => new sql.Request(transaction);
+
+    await request().query(`
+      DECLARE @today DATE = CAST(GETDATE() AS DATE);
+
+      DELETE l
+      FROM [dbo].[wms_production_line] l
+      INNER JOIN [dbo].[wms_sync_batch] b
+        ON l.batch_id = b.batch_id
+      WHERE b.batch_date = @today;
+    `);
+
+    await request().query(`
+      DECLARE @today DATE = CAST(GETDATE() AS DATE);
+
+      DELETE h
+      FROM [dbo].[wms_production_header] h
+      INNER JOIN [dbo].[wms_sync_batch] b
+        ON h.batch_id = b.batch_id
+      WHERE b.batch_date = @today;
+    `);
+
+    await request().query(`
+      DECLARE @today DATE = CAST(GETDATE() AS DATE);
+
+      DELETE FROM [dbo].[wms_sync_batch]
+      WHERE batch_date = @today;
+    `);
+
+    const resetResult = await request().query(`
+      DECLARE @today DATE = CAST(GETDATE() AS DATE);
+
+      UPDATE [dbo].[choppings]
+      SET sync_id = NULL
+      WHERE closed_by IS NOT NULL
+        AND (
+          CAST(created_at AS DATE) = @today
+          OR CAST(updated_at AS DATE) = @today
+        );
+    `);
+
+    await transaction.commit();
+
+    const rowsAffected = resetResult.rowsAffected?.[0] || 0;
+    logger.warn(`Reset ${rowsAffected} today choppings for rerun`);
+
+    return rowsAffected;
+  } catch (err) {
+    await transaction.rollback();
+    logger.error(`Failed to reset today sync data: ${err.message}`);
+    throw err;
+  }
+};
+
+/**
+ * Get hours that need processing.
+ * Normal mode: only sync_id IS NULL.
  */
 const getHoursToProcess = async (pool) => {
   logger.info('Getting hours to process...');
-  
+
   const syncStartDate = config.sync.startDate;
-  
-  const result = await pool.request().query(`
-    DECLARE @syncStartDate DATE = '${syncStartDate}';
-    
-    WITH ChoppingDates AS (
-      SELECT 
-        chopping_id,
-        CASE 
-          WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE) 
-          THEN CAST(updated_at AS DATE)
-          ELSE CAST(created_at AS DATE)
-        END AS production_date,
-        CASE 
-          WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE) 
-          THEN 0
-          ELSE DATEPART(HOUR, created_at)
-        END AS production_hour
-      FROM [dbo].[choppings]
-      WHERE closed_by IS NOT NULL
-    ),
-    Hours AS (
-      SELECT DISTINCT production_date, production_hour
-      FROM ChoppingDates
-      WHERE production_date >= @syncStartDate
-    )
-    SELECT 
-      h.production_date,
-      h.production_hour,
-      (SELECT COUNT(*) 
-       FROM ChoppingDates c 
-       WHERE c.production_date = h.production_date
-         AND c.production_hour = h.production_hour
-      ) AS chopping_count
-    FROM Hours h
-    ORDER BY h.production_date, h.production_hour
-  `);
-  
+
+  const result = await pool.request()
+    .input('syncStartDate', sql.Date, syncStartDate)
+    .query(`
+      WITH ChoppingDates AS (
+        SELECT
+          chopping_id,
+          CASE
+            WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE)
+            THEN CAST(updated_at AS DATE)
+            ELSE CAST(created_at AS DATE)
+          END AS production_date,
+          CASE
+            WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE)
+            THEN 0
+            ELSE DATEPART(HOUR, created_at)
+          END AS production_hour
+        FROM [dbo].[choppings]
+        WHERE closed_by IS NOT NULL
+          AND sync_id IS NULL
+      ),
+      Hours AS (
+        SELECT DISTINCT production_date, production_hour
+        FROM ChoppingDates
+        WHERE production_date >= @syncStartDate
+      )
+      SELECT
+        h.production_date,
+        h.production_hour,
+        (
+          SELECT COUNT(*)
+          FROM ChoppingDates c
+          WHERE c.production_date = h.production_date
+            AND c.production_hour = h.production_hour
+        ) AS chopping_count
+      FROM Hours h
+      ORDER BY h.production_date, h.production_hour;
+    `);
+
   logger.info(`Found ${result.recordset.length} hours to process`);
   return result.recordset;
 };
 
 /**
- * Get choppings for a specific hour
- * Handles midnight edge case: choppings closed after midnight go to hour 0 of close date
+ * Get unsynced choppings for a specific production date/hour.
  */
 const getChoppingsForHour = async (pool, productionDate, productionHour) => {
   const result = await pool.request()
     .input('productionDate', sql.Date, productionDate)
     .input('productionHour', sql.Int, productionHour)
     .query(`
-      SELECT 
+      SELECT
         chopping_id,
         CAST(created_at AS DATE) AS created_date,
         CAST(updated_at AS DATE) AS closed_date,
-        -- Calculate effective production date/hour
-        CASE 
-          WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE) 
+        CASE
+          WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE)
           THEN CAST(updated_at AS DATE)
           ELSE CAST(created_at AS DATE)
         END AS production_date,
-        CASE 
-          WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE) 
+        CASE
+          WHEN CAST(updated_at AS DATE) > CAST(created_at AS DATE)
           THEN 0
           ELSE DATEPART(HOUR, created_at)
         END AS production_hour
       FROM [dbo].[choppings]
       WHERE closed_by IS NOT NULL
+        AND sync_id IS NULL
         AND (
-          -- Normal case: created and closed same day
-          (CAST(updated_at AS DATE) = CAST(created_at AS DATE)
-           AND CAST(created_at AS DATE) = @productionDate
-           AND DATEPART(HOUR, created_at) = @productionHour)
+          (
+            CAST(updated_at AS DATE) = CAST(created_at AS DATE)
+            AND CAST(created_at AS DATE) = @productionDate
+            AND DATEPART(HOUR, created_at) = @productionHour
+          )
           OR
-          -- Midnight edge case: closed after midnight, goes to hour 0 of close date
-          (CAST(updated_at AS DATE) > CAST(created_at AS DATE)
-           AND CAST(updated_at AS DATE) = @productionDate
-           AND @productionHour = 0)
+          (
+            CAST(updated_at AS DATE) > CAST(created_at AS DATE)
+            AND CAST(updated_at AS DATE) = @productionDate
+            AND @productionHour = 0
+          )
         )
-      ORDER BY chopping_id
+      ORDER BY chopping_id;
     `);
-  
+
   return result.recordset;
 };
 
 /**
- * Get and group chopping lines for specific choppings
- * IMPORTANT: Join on BOTH chopping_id AND created_date (chopping_id repeats daily)
- * Note: Uses created_date for joining (where the lines actually exist), 
- *       but production_date for the output
+ * Get and group chopping lines for specific choppings.
  */
-const getGroupedChoppingLines = async (pool, choppings, productionDate) => {
-  if (choppings.length === 0) {
-    return { outputs: [], inputs: [] };
-  }
-  
-  // Build list with both chopping_id and their created_date
-  // For midnight edge cases, created_date differs from production_date
-  const choppingConditions = choppings.map(c => {
-    const createdDate = c.created_date instanceof Date 
-      ? c.created_date.toISOString().split('T')[0]
-      : c.created_date;
-    return `(cl.chopping_id = '${c.chopping_id}' AND CAST(cl.created_at AS DATE) = '${createdDate}')`;
-  }).join(' OR ');
-  
-  const result = await pool.request().query(`
-    SELECT 
+const getGroupedChoppingLines = async (pool, choppings) => {
+  if (!choppings.length) return { outputs: [], inputs: [] };
+
+  const values = choppings.map((_, index) => `(@choppingId${index}, @createdDate${index})`).join(', ');
+
+  const request = pool.request();
+
+  choppings.forEach((chopping, index) => {
+    request
+      .input(`choppingId${index}`, sql.NVarChar, String(chopping.chopping_id))
+      .input(`createdDate${index}`, sql.Date, toSqlDateString(chopping.created_date));
+  });
+
+  const result = await request.query(`
+    SELECT
       cl.chopping_id,
       cl.item_code,
       cl.weight,
       cl.output
     FROM [dbo].[chopping_lines] cl
-    WHERE (${choppingConditions})
+    INNER JOIN (VALUES ${values}) AS v(chopping_id, created_date)
+      ON cl.chopping_id = v.chopping_id
+     AND CAST(cl.created_at AS DATE) = v.created_date;
   `);
-  
+
   logger.debug(`Retrieved ${result.recordset.length} chopping lines`);
-  
-  // Group by: recipe_prefix + item_code + output
+
   const grouped = new Map();
-  
+
   for (const line of result.recordset) {
     const recipePrefix = getRecipePrefix(line.chopping_id);
     const mappedItem = mapItemCode(line.item_code);
-    
     const key = `${recipePrefix}|${mappedItem}|${line.output}`;
-    
+
     if (!grouped.has(key)) {
       grouped.set(key, {
         recipePrefix,
@@ -166,45 +237,46 @@ const getGroupedChoppingLines = async (pool, choppings, productionDate) => {
         lineCount: 0,
       });
     }
-    
+
     const entry = grouped.get(key);
     entry.totalWeight += parseFloat(line.weight) || 0;
     entry.lineCount += 1;
   }
-  
-  // Separate outputs and inputs
+
   const outputs = [];
   const inputs = [];
-  
+
   for (const data of grouped.values()) {
-    if (data.output === true || data.output === 1) {
-      outputs.push(data);
-    } else {
-      inputs.push(data);
-    }
+    if (data.output === true || data.output === 1) outputs.push(data);
+    else inputs.push(data);
   }
-  
+
   return { outputs, inputs };
 };
 
-/**
- * Reuse the batch row for a (date, hour) if one already exists, otherwise
- * create one. The schema enforces UQ_batch_date_hour, so each (date, hour)
- * has exactly one batch — late-arriving choppings re-aggregate into the
- * existing batch on a subsequent tick.
- *
- * Returns dailySeq computed as this batch's rank (by batch_id ASC) within the
- * date, so the production_order_no suffix stays stable across reuses. A
- * concurrent tick can race us on INSERT; we catch the unique-key violation,
- * read the row the other tick just wrote, and continue.
- */
+const getBatchDailySeq = async (pool, productionDate, batchId) => {
+  const result = await pool.request()
+    .input('batchDate', sql.Date, productionDate)
+    .input('batchId', sql.BigInt, batchId)
+    .query(`
+      SELECT COUNT(*) AS seq
+      FROM [dbo].[wms_sync_batch]
+      WHERE batch_date = @batchDate
+        AND batch_id <= @batchId;
+    `);
+
+  return result.recordset[0].seq;
+};
+
 const getOrCreateBatch = async (pool, productionDate, productionHour) => {
   const existing = await pool.request()
     .input('batchDate', sql.Date, productionDate)
     .input('batchHour', sql.Int, productionHour)
     .query(`
-      SELECT batch_id FROM [dbo].[wms_sync_batch]
-      WHERE batch_date = @batchDate AND batch_hour = @batchHour
+      SELECT batch_id
+      FROM [dbo].[wms_sync_batch]
+      WHERE batch_date = @batchDate
+        AND batch_hour = @batchHour;
     `);
 
   if (existing.recordset.length > 0) {
@@ -223,7 +295,7 @@ const getOrCreateBatch = async (pool, productionDate, productionHour) => {
       .query(`
         INSERT INTO [dbo].[wms_sync_batch] (batch_date, batch_hour, batch_cycle, status)
         OUTPUT INSERTED.batch_id
-        VALUES (@batchDate, @batchHour, @batchCycle, @status)
+        VALUES (@batchDate, @batchHour, @batchCycle, @status);
       `);
 
     const batchId = insertResult.recordset[0].batch_id;
@@ -231,53 +303,35 @@ const getOrCreateBatch = async (pool, productionDate, productionHour) => {
     logger.info(`Created batch ${batchId} for ${productionDate} hour ${productionHour} (seq: ${dailySeq})`);
     return { batchId, dailySeq, isNew: true };
   } catch (err) {
-    // 2627 = UNIQUE KEY violation, 2601 = unique index. A concurrent tick beat us
-    // to the INSERT — read the row it wrote and continue.
     if (err.number === 2627 || err.number === 2601) {
-      logger.warn(
-        `Concurrent insert on wms_sync_batch for batch_date=${productionDate}, batch_hour=${productionHour}: ${err.message}. Reading the row written by the other tick.`
-      );
+      logger.warn(`Concurrent batch insert detected for ${productionDate} hour ${productionHour}. Reading existing batch.`);
+
       const retry = await pool.request()
         .input('batchDate', sql.Date, productionDate)
         .input('batchHour', sql.Int, productionHour)
         .query(`
-          SELECT batch_id FROM [dbo].[wms_sync_batch]
-          WHERE batch_date = @batchDate AND batch_hour = @batchHour
+          SELECT batch_id
+          FROM [dbo].[wms_sync_batch]
+          WHERE batch_date = @batchDate
+            AND batch_hour = @batchHour;
         `);
+
       if (retry.recordset.length > 0) {
         const batchId = retry.recordset[0].batch_id;
         const dailySeq = await getBatchDailySeq(pool, productionDate, batchId);
         return { batchId, dailySeq, isNew: false };
       }
     }
-    logger.error(
-      `Failed to create batch (batch_date=${productionDate}, batch_hour=${productionHour}, batch_cycle=1, status=0): ${err.message}`
-    );
+
+    logger.error(`Failed to create batch: ${err.message}`);
     throw err;
   }
 };
 
-const getBatchDailySeq = async (pool, productionDate, batchId) => {
-  const result = await pool.request()
-    .input('batchDate', sql.Date, productionDate)
-    .input('batchId', sql.BigInt, batchId)
-    .query(`
-      SELECT COUNT(*) AS seq
-      FROM [dbo].[wms_sync_batch]
-      WHERE batch_date = @batchDate AND batch_id <= @batchId
-    `);
-  return result.recordset[0].seq;
-};
-
-/**
- * Build production orders from outputs
- */
 const buildProductionOrders = (outputs, productionDate, dailySeq) => {
-  const prodDateStr = productionDate instanceof Date 
-    ? productionDate.toISOString().split('T')[0]
-    : productionDate;
-  
-  return outputs.map(output => ({
+  const prodDateStr = toSqlDateString(productionDate);
+
+  return outputs.map((output) => ({
     recipePrefix: output.recipePrefix,
     productionDate: prodDateStr,
     outputItem: output.itemCode,
@@ -291,29 +345,26 @@ const buildProductionOrders = (outputs, productionDate, dailySeq) => {
   }));
 };
 
-/**
- * Insert production headers (skip if exists - idempotent)
- */
 const insertProductionHeaders = async (pool, orders, batchId) => {
   let inserted = 0;
-  
+
   for (const order of orders) {
     const locationCode = getLocationCode(order.outputItem);
-    
+
     try {
-      // Check if already exists
       const exists = await pool.request()
         .input('productionOrderNo', sql.NVarChar, order.productionOrderNo)
         .query(`
-          SELECT 1 FROM [dbo].[wms_production_header]
-          WHERE production_order_no = @productionOrderNo
+          SELECT 1
+          FROM [dbo].[wms_production_header]
+          WHERE production_order_no = @productionOrderNo;
         `);
-      
+
       if (exists.recordset.length > 0) {
         logger.debug(`Header ${order.productionOrderNo} already exists, skipping`);
         continue;
       }
-      
+
       await pool.request()
         .input('batchId', sql.BigInt, batchId)
         .input('productionOrderNo', sql.NVarChar, order.productionOrderNo)
@@ -324,58 +375,72 @@ const insertProductionHeaders = async (pool, orders, batchId) => {
         .input('lineNo', sql.Int, 1000)
         .input('routing', sql.NVarChar, 'Chopping')
         .input('orderType', sql.NVarChar, 'P18')
-        .input('productionDate', sql.Date, new Date(order.productionDate))
+        .input('productionDate', sql.Date, order.productionDate)
         .input('createdBy', sql.NVarChar, 'wms_sync')
         .query(`
           INSERT INTO [dbo].[wms_production_header] (
-            batch_id, production_order_no, item_no, quantity, uom,
-            location_code, line_no, routing, order_type, production_date, created_by
+            batch_id,
+            production_order_no,
+            item_no,
+            quantity,
+            uom,
+            location_code,
+            line_no,
+            routing,
+            order_type,
+            production_date,
+            created_by
           ) VALUES (
-            @batchId, @productionOrderNo, @itemNo, @quantity, @uom,
-            @locationCode, @lineNo, @routing, @orderType, @productionDate, @createdBy
-          )
+            @batchId,
+            @productionOrderNo,
+            @itemNo,
+            @quantity,
+            @uom,
+            @locationCode,
+            @lineNo,
+            @routing,
+            @orderType,
+            @productionDate,
+            @createdBy
+          );
         `);
-      
+
       inserted++;
     } catch (err) {
       logger.error(
         `Failed to insert header ${order.productionOrderNo} ` +
         `(batchId=${batchId}, itemNo=${order.outputItem}, qty=${order.outputWeight}, ` +
-        `locationCode=${locationCode}, productionDate=${order.productionDate}, ` +
-        `recipePrefix=${order.recipePrefix}): ${err.message}`
+        `locationCode=${locationCode}, productionDate=${order.productionDate}): ${err.message}`
       );
+      throw err;
     }
   }
 
   return inserted;
 };
 
-/**
- * Insert production lines (skip if exists - idempotent)
- */
 const insertProductionLines = async (pool, orders, inputs, batchId) => {
   let outputLines = 0;
   let inputLines = 0;
-  
-  const orderMap = new Map(
-    orders.map(o => [o.recipePrefix, o])
-  );
-  
-  // Insert output lines (line 1000)
+
+  const orderMap = new Map(orders.map((order) => [order.recipePrefix, order]));
+
   for (const order of orders) {
     const locationCode = getLocationCode(order.outputItem);
-    
+
     try {
       const exists = await pool.request()
         .input('productionOrderNo', sql.NVarChar, order.productionOrderNo)
         .input('lineNo', sql.Int, 1000)
         .query(`
-          SELECT 1 FROM [dbo].[wms_production_line]
-          WHERE production_order_no = @productionOrderNo AND line_no = @lineNo
+          SELECT 1
+          FROM [dbo].[wms_production_line]
+          WHERE production_order_no = @productionOrderNo
+            AND line_no = @lineNo;
         `);
-      
+
       if (exists.recordset.length > 0) continue;
-      
+
       await pool.request()
         .input('batchId', sql.BigInt, batchId)
         .input('productionOrderNo', sql.NVarChar, order.productionOrderNo)
@@ -386,78 +451,92 @@ const insertProductionLines = async (pool, orders, inputs, batchId) => {
         .input('locationCode', sql.NVarChar, locationCode)
         .input('entryType', sql.Int, 0)
         .input('orderType', sql.NVarChar, 'P18')
-        .input('productionDate', sql.Date, new Date(order.productionDate))
+        .input('productionDate', sql.Date, order.productionDate)
         .input('createdBy', sql.NVarChar, 'wms_sync')
         .query(`
           INSERT INTO [dbo].[wms_production_line] (
-            batch_id, production_order_no, line_no, item_no, quantity, uom,
-            location_code, entry_type, order_type, production_date, created_by
+            batch_id,
+            production_order_no,
+            line_no,
+            item_no,
+            quantity,
+            uom,
+            location_code,
+            entry_type,
+            order_type,
+            production_date,
+            created_by
           ) VALUES (
-            @batchId, @productionOrderNo, @lineNo, @itemNo, @quantity, @uom,
-            @locationCode, @entryType, @orderType, @productionDate, @createdBy
-          )
+            @batchId,
+            @productionOrderNo,
+            @lineNo,
+            @itemNo,
+            @quantity,
+            @uom,
+            @locationCode,
+            @entryType,
+            @orderType,
+            @productionDate,
+            @createdBy
+          );
         `);
-      
+
       outputLines++;
     } catch (err) {
-      logger.error(
-        `Failed to insert output line ${order.productionOrderNo}/1000 ` +
-        `(batchId=${batchId}, itemNo=${order.outputItem}, qty=${order.outputWeight}, ` +
-        `locationCode=${locationCode}, productionDate=${order.productionDate}): ${err.message}`
-      );
+      logger.error(`Failed to insert output line ${order.productionOrderNo}/1000: ${err.message}`);
+      throw err;
     }
   }
-  
-  // Group inputs by production order
+
   const inputsByOrder = new Map();
-  
+
   for (const input of inputs) {
     const order = orderMap.get(input.recipePrefix);
-    
+
     if (!order) {
       logger.warn(`No matching order for input recipe: ${input.recipePrefix}`);
       continue;
     }
-    
-    // Skip if input = output
+
     if (input.itemCode === order.outputItem) continue;
-    
+
     if (!inputsByOrder.has(order.productionOrderNo)) {
       inputsByOrder.set(order.productionOrderNo, []);
     }
-    
+
     inputsByOrder.get(order.productionOrderNo).push({
       ...input,
       productionOrderNo: order.productionOrderNo,
       productionDate: order.productionDate,
     });
   }
-  
-  // Insert input lines
+
   for (const [productionOrderNo, inputList] of inputsByOrder) {
     inputList.sort((a, b) => a.itemCode.localeCompare(b.itemCode));
-    
+
     let lineNo = 2000;
+
     for (const input of inputList) {
       const locationCode = getLocationCode(input.itemCode);
-      
+
       try {
         const exists = await pool.request()
           .input('productionOrderNo', sql.NVarChar, productionOrderNo)
           .input('itemNo', sql.NVarChar, input.itemCode)
           .input('entryType', sql.Int, 1)
           .query(`
-            SELECT 1 FROM [dbo].[wms_production_line]
-            WHERE production_order_no = @productionOrderNo 
-              AND item_no = @itemNo 
-              AND entry_type = @entryType
+            SELECT 1
+            FROM [dbo].[wms_production_line]
+            WHERE production_order_no = @productionOrderNo
+              AND item_no = @itemNo
+              AND entry_type = @entryType;
           `);
-        
+
         if (exists.recordset.length > 0) {
           lineNo += 1000;
           continue;
         }
-        
+
         await pool.request()
           .input('batchId', sql.BigInt, batchId)
           .input('productionOrderNo', sql.NVarChar, productionOrderNo)
@@ -468,55 +547,52 @@ const insertProductionLines = async (pool, orders, inputs, batchId) => {
           .input('locationCode', sql.NVarChar, locationCode)
           .input('entryType', sql.Int, 1)
           .input('orderType', sql.NVarChar, 'P18')
-          .input('productionDate', sql.Date, new Date(input.productionDate))
+          .input('productionDate', sql.Date, input.productionDate)
           .input('createdBy', sql.NVarChar, 'wms_sync')
           .query(`
             INSERT INTO [dbo].[wms_production_line] (
-              batch_id, production_order_no, line_no, item_no, quantity, uom,
-              location_code, entry_type, order_type, production_date, created_by
+              batch_id,
+              production_order_no,
+              line_no,
+              item_no,
+              quantity,
+              uom,
+              location_code,
+              entry_type,
+              order_type,
+              production_date,
+              created_by
             ) VALUES (
-              @batchId, @productionOrderNo, @lineNo, @itemNo, @quantity, @uom,
-              @locationCode, @entryType, @orderType, @productionDate, @createdBy
-            )
+              @batchId,
+              @productionOrderNo,
+              @lineNo,
+              @itemNo,
+              @quantity,
+              @uom,
+              @locationCode,
+              @entryType,
+              @orderType,
+              @productionDate,
+              @createdBy
+            );
           `);
-        
+
         inputLines++;
         lineNo += 1000;
       } catch (err) {
-        logger.error(
-          `Failed to insert input line ${productionOrderNo}/${lineNo} ` +
-          `(batchId=${batchId}, itemNo=${input.itemCode}, qty=${input.totalWeight}, ` +
-          `locationCode=${locationCode}, productionDate=${input.productionDate}): ${err.message}`
-        );
+        logger.error(`Failed to insert input line ${productionOrderNo}/${lineNo}: ${err.message}`);
+        throw err;
       }
     }
   }
-  
+
   return { outputLines, inputLines };
 };
 
-/**
- * Get Spice-Premix recipe for a G-item
- * Only returns recipe if exactly ONE recipe exists (recipe_count = 1)
- */
-
-
-/**
- * Build P17 production order number
- * SQL format:
- *   CONCAT('P17_', REPLACE(P18OrderNo, 'P18_', ''), '_', ItemNo)
- * Example:
- *   P18_3K31_260414_001  + G2009
- *   => P17_3K31_260414_001_G2009
- */
 const buildP17OrderNo = (p18OrderNo, itemNo) => {
   return `P17_${String(p18OrderNo).replace(/^P18_/, '')}_${itemNo}`;
 };
 
-/**
- * Get Spice-Premix recipe for a G-item
- * Only returns recipe if exactly ONE distinct recipe exists
- */
 const getSpicePremixRecipe = async (pool, itemCode) => {
   if (!String(itemCode).startsWith('G')) return null;
 
@@ -529,7 +605,7 @@ const getSpicePremixRecipe = async (pool, itemCode) => {
         MAX(batch_size) AS batch_size
       FROM [dbo].[RecipeData]
       WHERE output_item = @itemCode
-        AND [Process] = 'Spice premixing'
+        AND [Process] = 'Spice premixing';
     `);
 
   const row = countResult.recordset[0];
@@ -548,7 +624,7 @@ const getSpicePremixRecipe = async (pool, itemCode) => {
       FROM [dbo].[RecipeData]
       WHERE output_item = @itemCode
         AND [Process] = 'Spice premixing'
-      ORDER BY input_item
+      ORDER BY input_item;
     `);
 
   return {
@@ -558,21 +634,6 @@ const getSpicePremixRecipe = async (pool, itemCode) => {
   };
 };
 
-/**
- * Get qualifying P18 G-items from new tables, mirroring original SQL logic
- * Source = already-created P18 chopping headers in the new tables
- * Only returns rows where the matching P17 header does NOT already exist
- */
-/**
- * Get qualifying P18 G-items from production lines
- * Rule:
- * - source rows come from wms_production_line
- * - entry_type = 1
- * - item starts with G
- * - belongs to a P18 Chopping order
- * - item exists in RecipeData as Spice premixing with exactly one distinct recipe
- * - matching P17 does not already exist
- */
 const getQualifiedP18GItems = async (pool, batchId) => {
   const result = await pool.request()
     .input('batchId', sql.BigInt, batchId)
@@ -632,24 +693,15 @@ const getQualifiedP18GItems = async (pool, batchId) => {
         AND NOT EXISTS (
           SELECT 1
           FROM [dbo].[wms_production_header] h2
-          WHERE h2.production_order_no =
-            CONCAT('P17_', REPLACE(q.production_order_no, 'P18_', ''), '_', q.item_no)
+          WHERE h2.production_order_no = CONCAT('P17_', REPLACE(q.production_order_no, 'P18_', ''), '_', q.item_no)
             AND h2.order_type = 'P17'
         )
-      ORDER BY q.production_order_no, q.item_no
+      ORDER BY q.production_order_no, q.item_no;
     `);
 
   return result.recordset;
 };
 
-/**
- * Generate P17 orders for qualifying P18 G-items with single Spice-Premix recipe
- * Mirrors original SQL more closely:
- * - source rows come from inserted P18 headers
- * - only G-items
- * - only items with exactly one distinct Spice premixing recipe
- * - skip if matching P17 already exists
- */
 const generateP17Orders = async (pool, batchId) => {
   logger.info('Generating P17 orders...');
 
@@ -675,14 +727,13 @@ const generateP17Orders = async (pool, batchId) => {
         row.location_code ||
         getLocationCode(row.item_no);
 
-      // second idempotency guard
       const headerExists = await pool.request()
         .input('productionOrderNo', sql.NVarChar, p17OrderNo)
         .query(`
           SELECT 1
           FROM [dbo].[wms_production_header]
           WHERE production_order_no = @productionOrderNo
-            AND order_type = 'P17'
+            AND order_type = 'P17';
         `);
 
       if (headerExists.recordset.length > 0) {
@@ -690,7 +741,6 @@ const generateP17Orders = async (pool, batchId) => {
         continue;
       }
 
-      // Create P17 header
       await pool.request()
         .input('batchId', sql.BigInt, batchId)
         .input('productionOrderNo', sql.NVarChar, p17OrderNo)
@@ -705,17 +755,34 @@ const generateP17Orders = async (pool, batchId) => {
         .input('createdBy', sql.NVarChar, 'wms_sync')
         .query(`
           INSERT INTO [dbo].[wms_production_header] (
-            batch_id, production_order_no, item_no, quantity, uom,
-            location_code, line_no, routing, order_type, production_date, created_by
+            batch_id,
+            production_order_no,
+            item_no,
+            quantity,
+            uom,
+            location_code,
+            line_no,
+            routing,
+            order_type,
+            production_date,
+            created_by
           ) VALUES (
-            @batchId, @productionOrderNo, @itemNo, @quantity, @uom,
-            @locationCode, @lineNo, @routing, @orderType, @productionDate, @createdBy
-          )
+            @batchId,
+            @productionOrderNo,
+            @itemNo,
+            @quantity,
+            @uom,
+            @locationCode,
+            @lineNo,
+            @routing,
+            @orderType,
+            @productionDate,
+            @createdBy
+          );
         `);
 
       p17HeadersCreated++;
 
-      // Create P17 output line
       await pool.request()
         .input('batchId', sql.BigInt, batchId)
         .input('productionOrderNo', sql.NVarChar, p17OrderNo)
@@ -730,20 +797,35 @@ const generateP17Orders = async (pool, batchId) => {
         .input('createdBy', sql.NVarChar, 'wms_sync')
         .query(`
           INSERT INTO [dbo].[wms_production_line] (
-            batch_id, production_order_no, line_no, item_no, quantity, uom,
-            location_code, entry_type, order_type, production_date, created_by
+            batch_id,
+            production_order_no,
+            line_no,
+            item_no,
+            quantity,
+            uom,
+            location_code,
+            entry_type,
+            order_type,
+            production_date,
+            created_by
           ) VALUES (
-            @batchId, @productionOrderNo, @lineNo, @itemNo, @quantity, @uom,
-            @locationCode, @entryType, @orderType, @productionDate, @createdBy
-          )
+            @batchId,
+            @productionOrderNo,
+            @lineNo,
+            @itemNo,
+            @quantity,
+            @uom,
+            @locationCode,
+            @entryType,
+            @orderType,
+            @productionDate,
+            @createdBy
+          );
         `);
 
       p17LinesCreated++;
 
-      // Create P17 input lines from recipe
-      // SQL equivalent starts first generated input line at 3000
       let lineNo = 3000;
-
       const ingredients = [...recipe.ingredients].sort((a, b) =>
         String(a.input_item).localeCompare(String(b.input_item))
       );
@@ -752,14 +834,13 @@ const generateP17Orders = async (pool, batchId) => {
         const batchSize = parseFloat(ingredient.batch_size || recipe.batchSize || 0);
         const inputQtyPer = parseFloat(ingredient.input_item_qt_per || 0);
 
-        if (!batchSize || batchSize === 0) {
+        if (!batchSize) {
           logger.warn(`Skipping ingredient ${ingredient.input_item} for ${p17OrderNo}: invalid batch_size`);
           continue;
         }
 
         const inputQty = (parseFloat(row.quantity) / batchSize) * inputQtyPer;
-        const inputLocation =
-          ingredient.input_item_location || getLocationCode(ingredient.input_item);
+        const inputLocation = ingredient.input_item_location || getLocationCode(ingredient.input_item);
         const inputUom = ingredient.input_item_uom || 'KG';
 
         const lineExists = await pool.request()
@@ -771,7 +852,7 @@ const generateP17Orders = async (pool, batchId) => {
             FROM [dbo].[wms_production_line]
             WHERE production_order_no = @productionOrderNo
               AND item_no = @itemNo
-              AND entry_type = @entryType
+              AND entry_type = @entryType;
           `);
 
         if (lineExists.recordset.length > 0) {
@@ -793,12 +874,30 @@ const generateP17Orders = async (pool, batchId) => {
           .input('createdBy', sql.NVarChar, 'wms_sync')
           .query(`
             INSERT INTO [dbo].[wms_production_line] (
-              batch_id, production_order_no, line_no, item_no, quantity, uom,
-              location_code, entry_type, order_type, production_date, created_by
+              batch_id,
+              production_order_no,
+              line_no,
+              item_no,
+              quantity,
+              uom,
+              location_code,
+              entry_type,
+              order_type,
+              production_date,
+              created_by
             ) VALUES (
-              @batchId, @productionOrderNo, @lineNo, @itemNo, @quantity, @uom,
-              @locationCode, @entryType, @orderType, @productionDate, @createdBy
-            )
+              @batchId,
+              @productionOrderNo,
+              @lineNo,
+              @itemNo,
+              @quantity,
+              @uom,
+              @locationCode,
+              @entryType,
+              @orderType,
+              @productionDate,
+              @createdBy
+            );
           `);
 
         p17LinesCreated++;
@@ -807,11 +906,8 @@ const generateP17Orders = async (pool, batchId) => {
 
       logger.debug(`Created P17 ${p17OrderNo} with ${ingredients.length} ingredient rows`);
     } catch (err) {
-      logger.error(
-        `Failed to create P17 for ${row.production_order_no}/${row.item_no} ` +
-        `(batchId=${batchId}, p17OrderNo=${p17OrderNo}, qty=${row.quantity}, ` +
-        `locationCode=${row.location_code}, productionDate=${row.production_date}): ${err.message}`
-      );
+      logger.error(`Failed to create P17 for ${row.production_order_no}/${row.item_no}: ${err.message}`);
+      throw err;
     }
   }
 
@@ -819,42 +915,110 @@ const generateP17Orders = async (pool, batchId) => {
   return { p17HeadersCreated, p17LinesCreated };
 };
 
-export const runSync = async () => {
-  const pool = await connectWms();
-  
-  try {
-    await prepChoppingLines(pool);
+/**
+ * Mark processed choppings as synced using batchId.
+ */
+const markChoppingsAsSynced = async (pool, choppings, batchId) => {
+  if (!choppings.length) return 0;
 
-    await loadItemMappings(pool);
-    await loadItemLocations(pool);
+  const values = choppings.map((_, index) => `(@choppingId${index}, @createdDate${index})`).join(', ');
 
-    const hoursToProcess = await getHoursToProcess(pool);
-    
-    for (const { production_date, production_hour, chopping_count } of hoursToProcess) {
-      logger.info(`Processing ${production_date} hour ${production_hour} (${chopping_count} choppings)`);
-      
-      const choppings = await getChoppingsForHour(pool, production_date, production_hour);
-      if (!choppings.length) continue;
+  const request = pool.request().input('batchId', sql.BigInt, batchId);
 
-      const { outputs, inputs } = await getGroupedChoppingLines(pool, choppings, production_date);
+  choppings.forEach((chopping, index) => {
+    request
+      .input(`choppingId${index}`, sql.NVarChar, String(chopping.chopping_id))
+      .input(`createdDate${index}`, sql.Date, toSqlDateString(chopping.created_date));
+  });
 
-      const { batchId, dailySeq } = await getOrCreateBatch(pool, production_date, production_hour);
+  const result = await request.query(`
+    UPDATE c
+    SET c.sync_id = @batchId
+    FROM [dbo].[choppings] c
+    INNER JOIN (VALUES ${values}) AS v(chopping_id, created_date)
+      ON c.chopping_id = v.chopping_id
+     AND CAST(c.created_at AS DATE) = v.created_date
+    WHERE c.closed_by IS NOT NULL
+      AND c.sync_id IS NULL;
+  `);
 
-      const orders = buildProductionOrders(outputs, production_date, dailySeq);
-      const headersInserted = await insertProductionHeaders(pool, orders, batchId);
-      const { outputLines, inputLines } = await insertProductionLines(pool, orders, inputs, batchId);
+  const rowsAffected = result.rowsAffected?.[0] || 0;
+  logger.info(`Marked ${rowsAffected} choppings as synced with sync_id=${batchId}`);
 
-      logger.info(`Batch ${batchId}: Inserted ${headersInserted} headers, ${outputLines} output lines, ${inputLines} input lines`);
+  return rowsAffected;
+};
 
-      // Generate P17 orders for qualifying P18 G-items
-      await generateP17Orders(pool, batchId);
+const processPendingSync = async (pool) => {
+  await prepChoppingLines(pool);
+  await loadItemMappings(pool);
+  await loadItemLocations(pool);
+
+  const hoursToProcess = await getHoursToProcess(pool);
+
+  for (const { production_date, production_hour, chopping_count } of hoursToProcess) {
+    logger.info(`Processing ${production_date} hour ${production_hour} (${chopping_count} choppings)`);
+
+    const choppings = await getChoppingsForHour(pool, production_date, production_hour);
+    if (!choppings.length) continue;
+
+    const { outputs, inputs } = await getGroupedChoppingLines(pool, choppings);
+
+    if (!outputs.length) {
+      logger.warn(`No output lines found for ${production_date} hour ${production_hour}; skipping sync_id update`);
+      continue;
     }
-    
-    return { success: true };
+
+    const { batchId, dailySeq } = await getOrCreateBatch(pool, production_date, production_hour);
+    const orders = buildProductionOrders(outputs, production_date, dailySeq);
+
+    const headersInserted = await insertProductionHeaders(pool, orders, batchId);
+    const { outputLines, inputLines } = await insertProductionLines(pool, orders, inputs, batchId);
+
+    logger.info(
+      `Batch ${batchId}: Inserted ${headersInserted} headers, ${outputLines} output lines, ${inputLines} input lines`
+    );
+
+    await generateP17Orders(pool, batchId);
+
+    await markChoppingsAsSynced(pool, choppings, batchId);
   }
 
-  catch (err) {
+  return { success: true, processedHours: hoursToProcess.length };
+};
+
+/**
+ * Normal sync.
+ * Processes only choppings where sync_id IS NULL.
+ */
+export const runSync = async () => {
+  const pool = await connectWms();
+
+  try {
+    return await processPendingSync(pool);
+  } catch (err) {
     logger.error('Error during sync:', err);
     return { success: false, error: err };
+  }
+};
+
+/**
+ * Full rebuild for today's production date.
+ * Use this when you want to rerun all of today, including missed midnight cases.
+ */
+export const rerunTodaySync = async () => {
+  const pool = await connectWms();
+
+  try {
+    const resetChoppings = await resetTodaySyncData(pool);
+    const result = await processPendingSync(pool);
+
+    return {
+      ...result,
+      rerunToday: true,
+      resetChoppings,
+    };
+  } catch (err) {
+    logger.error('Error during today rerun sync:', err);
+    return { success: false, rerunToday: true, error: err };
   }
 };
