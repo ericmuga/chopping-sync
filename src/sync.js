@@ -34,77 +34,87 @@ const toSqlDateString = (value) => {
  * - normal today/future choppings: created_at >= today
  * - midnight/missed cases: created_at may be yesterday, updated_at >= today
  */
+
+/**
+ * Reset generated sync data from configured sync start date onward.
+ * This allows full rebuilds by only changing .env and restarting.
+ */
 const resetFromTodaySyncData = async (pool) => {
-  logger.warn('Resetting sync data from today onward before rerun...');
+  const syncStartDate = config.sync.startDate;
+
+  logger.warn(
+    `Resetting sync data from ${syncStartDate} onward before rerun...`
+  );
 
   const transaction = new sql.Transaction(pool);
 
   try {
     await transaction.begin();
 
-    const request = () => new sql.Request(transaction);
+    const request = () =>
+      new sql.Request(transaction)
+        .input('syncStartDate', sql.Date, syncStartDate);
 
     await request().query(`
-      DECLARE @today DATE = CAST(GETDATE() AS DATE);
-
       DELETE l
       FROM [dbo].[wms_production_line] l
       INNER JOIN [dbo].[wms_sync_batch] b
         ON l.batch_id = b.batch_id
-      WHERE b.batch_date >= @today;
+      WHERE b.batch_date >= @syncStartDate;
     `);
 
     await request().query(`
-      DECLARE @today DATE = CAST(GETDATE() AS DATE);
-
       DELETE h
       FROM [dbo].[wms_production_header] h
       INNER JOIN [dbo].[wms_sync_batch] b
         ON h.batch_id = b.batch_id
-      WHERE b.batch_date >= @today;
+      WHERE b.batch_date >= @syncStartDate;
     `);
 
     await request().query(`
-      DECLARE @today DATE = CAST(GETDATE() AS DATE);
-
       DELETE s
       FROM [dbo].[wms_bc_sync_log] s
       INNER JOIN [dbo].[wms_sync_batch] b
         ON s.batch_id = b.batch_id
-      WHERE b.batch_date >= @today;
+      WHERE b.batch_date >= @syncStartDate;
     `);
 
     await request().query(`
-      DECLARE @today DATE = CAST(GETDATE() AS DATE);
-
       DELETE FROM [dbo].[wms_sync_batch]
-      WHERE batch_date >= @today;
+      WHERE batch_date >= @syncStartDate;
     `);
 
     const resetResult = await request().query(`
-      DECLARE @today DATE = CAST(GETDATE() AS DATE);
-
       UPDATE [dbo].[choppings]
       SET sync_id = NULL
       WHERE closed_by IS NOT NULL
         AND (
-          CAST(created_at AS DATE) >= @today
-          OR CAST(updated_at AS DATE) >= @today
+          CAST(created_at AS DATE) >= @syncStartDate
+          OR CAST(updated_at AS DATE) >= @syncStartDate
         );
     `);
 
     await transaction.commit();
 
     const rowsAffected = resetResult.rowsAffected?.[0] || 0;
-    logger.warn(`Reset ${rowsAffected} choppings from today onward for rerun`);
+
+    logger.warn(
+      `Reset ${rowsAffected} choppings from ${syncStartDate} onward for rerun`
+    );
 
     return rowsAffected;
   } catch (err) {
     await transaction.rollback();
-    logger.error(`Failed to reset sync data from today onward: ${err.message}`);
+
+    logger.error(
+      `Failed to reset sync data from ${syncStartDate} onward: ${err.message}`
+    );
+
     throw err;
   }
 };
+
+
 
 /**
  * Get hours that need processing.
