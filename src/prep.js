@@ -70,11 +70,10 @@ CREATE CLUSTERED INDEX IX_ClosedChoppings_ID ON #ClosedChoppings([chopping_id]);
                 'G2125','G2126','G2127','G2128','G2129','G2130','G2131','G2132',
                 'G2133','G2137','G2139','G2140','G2141','G2142','G2143','G2145',
                 'G2146','G2147','G2148','G2151','G2157','G2158','G2162','G2165',
-                'G2166','G2167','G2172','G2173','G2174','G2176','D213021','G2181'
-            
-	    -- Always include these if present in template_lines
+                'G2166','G2167','G2172','G2173','G2174','G2176','D213021','G2181',
+                -- Always include these if present in template_lines
                 'G8900','G8901'
-	    )
+            )
         )
         AND NOT EXISTS (
             SELECT 1
