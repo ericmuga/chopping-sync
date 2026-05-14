@@ -1,0 +1,15 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 30
+    },
+    "auditLog": "logs\\.90367d7f272ed79a9d62a9509452aa5d35988aba-audit.json",
+    "files": [
+        {
+            "date": 1776224732822,
+            "name": "logs\\wms-sync-2026-04-15.log",
+            "hash": "51aa1557cea4ac716c0312e7d6678c82d7ffa1e0d16aef68fe943fd4138f2f73"
+        }
+    ],
+    "hashType": "sha256"
+}
