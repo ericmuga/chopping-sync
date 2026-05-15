@@ -209,7 +209,7 @@ INNER JOIN [calibra].[dbo].[template_lines] AS tl
    AND LOWER(tl.[type]) <> 'intake'
 WHERE
     cl.[created_at] >= @WorkDate
-    AND cl.[item_code] NOT IN ('H221187', 'H221188')
+    AND cl.[item_code] NOT IN ('H221187', 'H221188','H221053')
     AND cl.[item_code] <> tl.[item_code]
 GROUP BY
     cl.[chopping_id],
