@@ -861,7 +861,12 @@ const generateP17Orders = async (pool, batchId) => {
 
         const inputQty = (parseFloat(row.quantity) / batchSize) * inputQtyPer;
         const inputLocation = ingredient.input_item_location || getLocationCode(ingredient.input_item);
-        const inputUom = ingredient.input_item_uom || 'KG';
+        let inputUom = ingredient.input_item_uom || 'KG';
+        
+        // Force specific items to always use KG
+        if (['H221187', 'H221188', 'H221053'].includes(ingredient.input_item)) {
+          inputUom = 'KG';
+        }
 
         const lineExists = await pool.request()
           .input('productionOrderNo', sql.NVarChar, p17OrderNo)
