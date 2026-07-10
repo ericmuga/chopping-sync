@@ -8,7 +8,8 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
-      "Bash(node --check F:/applications/chopping-sync/src/config.js)"
+      "Bash(node --check F:/applications/chopping-sync/src/config.js)",
+      "Bash(git commit -m 'Force UOM to PC for items H221187, H221188, H221053 *)"
     ]
   }
 }

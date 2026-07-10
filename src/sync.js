@@ -863,9 +863,9 @@ const generateP17Orders = async (pool, batchId) => {
         const inputLocation = ingredient.input_item_location || getLocationCode(ingredient.input_item);
         let inputUom = ingredient.input_item_uom || 'KG';
         
-        // Force specific items to always use KG
+        // Force specific items to always use PC
         if (['H221187', 'H221188', 'H221053'].includes(ingredient.input_item)) {
-          inputUom = 'KG';
+          inputUom = 'PC';
         }
 
         const lineExists = await pool.request()
