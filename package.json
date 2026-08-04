@@ -1,7 +1,7 @@
 {
   "name": "wms-bc-sync-service",
   "version": "1.0.0",
-  "description": "WMS to Business Central hourly sync service",
+  "description": "WMS to Business Central chopping sync service",
   "type": "module",
   "main": "src/index.js",
   "scripts": {

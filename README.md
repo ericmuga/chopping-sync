@@ -29,13 +29,11 @@ wms-sync-service-es6/
 1. Get Unsynced Choppings
    └── WHERE closed_by IS NOT NULL AND sync_id IS NULL
 
-2. Group Chopping Lines
-   └── BY: recipe_prefix + item + output + date
+2. Process Each Chopping
+   └── One closed chopping becomes one batch and one production transaction
 
-   1230G42-1 ─┐
-   1230G42-2 ─┼─► 1230G42 | G2159 (output) | 2,254 kg
-   1230G42-15─┘            G2005 (input)  |   536 kg
-                           G8900 (input)  |   911 kg
+   1230G42-1 ─► batch 101 ─► P18_3G42_G2159_260414_001
+   1230G42-2 ─► batch 102 ─► P18_3G42_G2159_260414_002
 
 3. Build Production Orders
    └── P18_3G42_G2159_260414_001

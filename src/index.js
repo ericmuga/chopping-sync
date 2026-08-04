@@ -22,7 +22,7 @@ const startScheduler = () => {
 
 const main = async () => {
   logger.info('WMS Sync Service starting...');
-  logger.info(`Config: startDate=${config.sync.startDate}, interval=${config.sync.batchCycleHours}h`);
+  logger.info(`Config: startDate=${config.sync.startDate}, interval=${config.sync.batchCycleHours}h, batching=per chopping`);
   
   const args = process.argv.slice(2);
   
