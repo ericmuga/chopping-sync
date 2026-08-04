@@ -89,6 +89,10 @@ const resetFromTodaySyncData = async (pool) => {
       SET sync_id = NULL
       WHERE closed_by IS NOT NULL
         AND (
+          TRY_CONVERT(INT, status) = 1
+          OR LOWER(LTRIM(RTRIM(TRY_CONVERT(NVARCHAR(20), status)))) IN ('closed', 'complete', 'completed')
+        )
+        AND (
           CAST(created_at AS DATE) >= @syncStartDate
           OR CAST(updated_at AS DATE) >= @syncStartDate
         );
@@ -130,6 +134,7 @@ const getChoppingsToProcess = async (pool) => {
     .query(`
       WITH ChoppingDates AS (
         SELECT
+          id AS chopping_row_id,
           chopping_id,
           CAST(created_at AS DATE) AS created_date,
           CAST(updated_at AS DATE) AS closed_date,
@@ -146,8 +151,13 @@ const getChoppingsToProcess = async (pool) => {
         FROM [dbo].[choppings]
         WHERE closed_by IS NOT NULL
           AND sync_id IS NULL
+          AND (
+            TRY_CONVERT(INT, status) = 1
+            OR LOWER(LTRIM(RTRIM(TRY_CONVERT(NVARCHAR(20), status)))) IN ('closed', 'complete', 'completed')
+          )
       )
       SELECT
+        chopping_row_id,
         chopping_id,
         created_date,
         closed_date,
@@ -155,7 +165,7 @@ const getChoppingsToProcess = async (pool) => {
         production_hour
       FROM ChoppingDates
       WHERE production_date >= @syncStartDate
-      ORDER BY production_date, production_hour, chopping_id;
+      ORDER BY production_date, production_hour, chopping_row_id;
     `);
 
   logger.info(`Found ${result.recordset.length} choppings to process`);
@@ -239,12 +249,45 @@ const getBatchDailySeq = async (pool, productionDate, batchId) => {
   return result.recordset[0].seq;
 };
 
-const createBatch = async (pool, productionDate, productionHour) => {
+const buildBatchHourKey = (productionHour, choppingRowId) => {
+  const parsedChoppingRowId = Number.parseInt(String(choppingRowId), 10);
+  if (Number.isFinite(parsedChoppingRowId) && parsedChoppingRowId > 0) return parsedChoppingRowId;
+  return productionHour;
+};
+
+const getExistingBatch = async (pool, productionDate, batchHourKey) => {
+  const result = await pool.request()
+    .input('batchDate', sql.Date, productionDate)
+    .input('batchHour', sql.Int, batchHourKey)
+    .query(`
+      SELECT TOP 1 batch_id
+      FROM [dbo].[wms_sync_batch]
+      WHERE batch_date = @batchDate
+        AND batch_hour = @batchHour
+      ORDER BY batch_id DESC;
+    `);
+
+  return result.recordset[0]?.batch_id || null;
+};
+
+const createBatch = async (pool, productionDate, productionHour, choppingRowId) => {
+  const batchHourKey = buildBatchHourKey(productionHour, choppingRowId);
+
   try {
+    const existingBatchId = await getExistingBatch(pool, productionDate, batchHourKey);
+
+    if (existingBatchId) {
+      const dailySeq = await getBatchDailySeq(pool, productionDate, existingBatchId);
+      logger.info(
+        `Reusing batch ${existingBatchId} for ${productionDate} batch_key ${batchHourKey} (chopping_row_id=${choppingRowId}, seq: ${dailySeq})`
+      );
+      return { batchId: existingBatchId, dailySeq };
+    }
+
     const insertResult = await pool.request()
       .input('batchDate', sql.Date, productionDate)
-      .input('batchHour', sql.Int, productionHour)
-      .input('batchCycle', sql.Int, 1)
+      .input('batchHour', sql.Int, batchHourKey)
+         .input('batchCycle', sql.Int, 1)
       .input('status', sql.TinyInt, 0)
       .query(`
         INSERT INTO [dbo].[wms_sync_batch] (batch_date, batch_hour, batch_cycle, status)
@@ -254,15 +297,29 @@ const createBatch = async (pool, productionDate, productionHour) => {
 
     const batchId = insertResult.recordset[0].batch_id;
     const dailySeq = await getBatchDailySeq(pool, productionDate, batchId);
-    logger.info(`Created batch ${batchId} for ${productionDate} hour ${productionHour} (seq: ${dailySeq})`);
+    logger.info(
+      `Created batch ${batchId} for ${productionDate} batch_key ${batchHourKey} (chopping_row_id=${choppingRowId}, hour=${productionHour}, seq: ${dailySeq})`
+    );
     return { batchId, dailySeq };
   } catch (err) {
+    if (err?.number === 2627 || String(err?.message || '').includes('UQ_batch_date_hour')) {
+      const existingBatchId = await getExistingBatch(pool, productionDate, batchHourKey);
+
+      if (existingBatchId) {
+        const dailySeq = await getBatchDailySeq(pool, productionDate, existingBatchId);
+        logger.warn(
+          `Batch already exists for ${productionDate} batch_key ${batchHourKey}; reusing ${existingBatchId} (chopping_row_id=${choppingRowId}, seq: ${dailySeq})`
+        );
+        return { batchId: existingBatchId, dailySeq };
+      }
+    }
+
     logger.error(`Failed to create batch: ${err.message}`);
     throw err;
   }
 };
 
-const buildProductionOrders = (outputs, productionDate, dailySeq) => {
+const buildProductionOrders = (outputs, productionDate, choppingRowId) => {
   const prodDateStr = toSqlDateString(productionDate);
 
   return outputs.map((output) => ({
@@ -274,7 +331,7 @@ const buildProductionOrders = (outputs, productionDate, dailySeq) => {
       output.recipePrefix,
       output.itemCode,
       prodDateStr,
-      dailySeq
+      choppingRowId
     ),
   }));
 };
@@ -530,8 +587,8 @@ const buildP17OrderNo = (p18OrderNo, itemNo) => {
     const shortRecipe = parts[1];
     const dateStr = parts[2];
     const outputItem = parts[3];
-    const seqStr = parts[4];
-    return `P17_${shortRecipe}_${dateStr}_${outputItem}_${itemNo}_${seqStr}`;
+    const runIdStr = parts[4];
+       return `P17_${shortRecipe}_${dateStr}_${outputItem}_${itemNo}_${runIdStr}`;
   }
 
   return `P17_${String(p18OrderNo).replace(/^P18_/, '')}_${itemNo}`;
@@ -870,24 +927,25 @@ const generateP17Orders = async (pool, batchId) => {
 const markChoppingsAsSynced = async (pool, choppings, batchId) => {
   if (!choppings.length) return 0;
 
-  const values = choppings.map((_, index) => `(@choppingId${index}, @createdDate${index})`).join(', ');
+  const values = choppings.map((_, index) => `(@choppingRowId${index})`).join(', ');
 
   const request = pool.request().input('batchId', sql.BigInt, batchId);
 
   choppings.forEach((chopping, index) => {
-    request
-      .input(`choppingId${index}`, sql.NVarChar, String(chopping.chopping_id))
-      .input(`createdDate${index}`, sql.Date, toSqlDateString(chopping.created_date));
+    request.input(`choppingRowId${index}`, sql.BigInt, chopping.chopping_row_id);
   });
 
   const result = await request.query(`
     UPDATE c
     SET c.sync_id = @batchId
     FROM [dbo].[choppings] c
-    INNER JOIN (VALUES ${values}) AS v(chopping_id, created_date)
-      ON c.chopping_id = v.chopping_id
-     AND CAST(c.created_at AS DATE) = v.created_date
+    INNER JOIN (VALUES ${values}) AS v(chopping_row_id)
+      ON c.id = v.chopping_row_id
     WHERE c.closed_by IS NOT NULL
+      AND (
+        TRY_CONVERT(INT, c.status) = 1
+        OR LOWER(LTRIM(RTRIM(TRY_CONVERT(NVARCHAR(20), c.status)))) IN ('closed', 'complete', 'completed')
+      )
       AND c.sync_id IS NULL;
   `);
 
@@ -905,7 +963,9 @@ const processPendingSync = async (pool) => {
   const choppingsToProcess = await getChoppingsToProcess(pool);
 
   for (const chopping of choppingsToProcess) {
-    logger.info(`Processing chopping ${chopping.chopping_id} (${chopping.production_date} hour ${chopping.production_hour})`);
+    logger.info(
+      `Processing chopping ${chopping.chopping_id} (row_id=${chopping.chopping_row_id}, ${chopping.production_date} hour ${chopping.production_hour})`
+    );
 
     const { outputs, inputs } = await getGroupedChoppingLines(pool, [chopping]);
 
@@ -914,8 +974,13 @@ const processPendingSync = async (pool) => {
       continue;
     }
 
-    const { batchId, dailySeq } = await createBatch(pool, chopping.production_date, chopping.production_hour);
-    const orders = buildProductionOrders(outputs, chopping.production_date, dailySeq);
+    const { batchId } = await createBatch(
+      pool,
+      chopping.production_date,
+      chopping.production_hour,
+      chopping.chopping_row_id
+    );
+    const orders = buildProductionOrders(outputs, chopping.production_date, chopping.chopping_row_id);
 
     const headersInserted = await insertProductionHeaders(pool, orders, batchId);
     const { outputLines, inputLines } = await insertProductionLines(pool, orders, inputs, batchId);

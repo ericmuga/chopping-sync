@@ -57,13 +57,13 @@ export const formatDateYYMMDD = (date) => {
 
 /**
  * Build production order number
- * Format: P18_3K31_260414_G2159_001
+ * Format: P18_3K31_260414_G2159_333787
  */
-export const buildProductionOrderNo = (recipePrefix, outputItem, productionDate, batchSeq) => {
+export const buildProductionOrderNo = (recipePrefix, outputItem, productionDate, choppingRowId) => {
   const shortRecipe = getShortRecipeCode(recipePrefix);
   const dateStr = formatDateYYMMDD(productionDate);
-  const seqStr = String(batchSeq).padStart(3, '0');
-  return `P18_${shortRecipe}_${dateStr}_${outputItem}_${seqStr}`;
+  const runIdStr = String(choppingRowId);
+  return `P18_${shortRecipe}_${dateStr}_${outputItem}_${runIdStr}`;
 };
 
 /**

@@ -37,7 +37,11 @@ SELECT DISTINCT [chopping_id]
 INTO #ClosedChoppings
 FROM [calibra].[dbo].[choppings]
 WHERE [created_at] >= @WorkDate
-  AND [closed_by] IS NOT NULL;
+    AND [closed_by] IS NOT NULL
+    AND (
+            TRY_CONVERT(INT, [status]) = 1
+            OR LOWER(LTRIM(RTRIM(TRY_CONVERT(NVARCHAR(20), [status])))) IN ('closed', 'complete', 'completed')
+    );
 
 CREATE CLUSTERED INDEX IX_ClosedChoppings_ID ON #ClosedChoppings([chopping_id]);
 
