@@ -1,5 +1,17 @@
 import 'dotenv/config';
 
+const parseBatchCycleMinutes = () => {
+  const minutesRaw = process.env.BATCH_CYCLE_MINUTES;
+  const parsedMinutes = Number.parseInt(minutesRaw || '', 10);
+  if (Number.isFinite(parsedMinutes) && parsedMinutes > 0) return parsedMinutes;
+
+  const hoursRaw = process.env.BATCH_CYCLE_HOURS;
+  const parsedHours = Number.parseInt(hoursRaw || '', 10);
+  if (Number.isFinite(parsedHours) && parsedHours > 0) return parsedHours * 60;
+
+  return 5;
+};
+
 export const config = {
   wmsDb: {
     server: process.env.WMS_DB_SERVER || 'FCL-WMS',
@@ -17,7 +29,7 @@ export const config = {
   },
   sync: {
     startDate: process.env.SYNC_START_DATE || '2026-04-14',
-    batchCycleMinutes: parseInt(process.env.BATCH_CYCLE_MINUTES || '5'),
+    batchCycleMinutes: parseBatchCycleMinutes(),
     defaultLocationCode: process.env.DEFAULT_LOCATION_CODE || '2055',
   },
   logging: {
