@@ -94,7 +94,7 @@ npm run service:uninstall
 | `WMS_DB_USER` | - | SQL username |
 | `WMS_DB_PASSWORD` | - | SQL password |
 | `SYNC_START_DATE` | 2026-04-14 | Only process from this date |
-| `BATCH_CYCLE_HOURS` | 1 | Run interval (hours) |
+| `BATCH_CYCLE_MINUTES` | 5 | Run interval (minutes) |
 | `DEFAULT_LOCATION_CODE` | 2055 | Default location |
 | `LOG_LEVEL` | info | debug/info/warn/error |
 

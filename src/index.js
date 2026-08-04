@@ -9,9 +9,9 @@ import { closeConnections } from './db.js';
 import { runSync } from './sync.js';
 
 const startScheduler = () => {
-  const intervalMs = config.sync.batchCycleHours * 60 * 60 * 1000;
+  const intervalMs = config.sync.batchCycleMinutes * 60 * 1000;
   
-  logger.info(`Starting scheduler (every ${config.sync.batchCycleHours} hour(s))`);
+  logger.info(`Starting scheduler (every ${config.sync.batchCycleMinutes} minute(s))`);
   
   // Run immediately
   runSync();
@@ -22,7 +22,7 @@ const startScheduler = () => {
 
 const main = async () => {
   logger.info('WMS Sync Service starting...');
-  logger.info(`Config: startDate=${config.sync.startDate}, interval=${config.sync.batchCycleHours}h, batching=per chopping`);
+  logger.info(`Config: startDate=${config.sync.startDate}, interval=${config.sync.batchCycleMinutes}m, batching=per chopping`);
   
   const args = process.argv.slice(2);
   

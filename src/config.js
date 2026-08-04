@@ -17,7 +17,7 @@ export const config = {
   },
   sync: {
     startDate: process.env.SYNC_START_DATE || '2026-04-14',
-    batchCycleHours: parseInt(process.env.BATCH_CYCLE_HOURS || '1'),
+    batchCycleMinutes: parseInt(process.env.BATCH_CYCLE_MINUTES || '5'),
     defaultLocationCode: process.env.DEFAULT_LOCATION_CODE || '2055',
   },
   logging: {
