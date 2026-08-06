@@ -586,9 +586,8 @@ const buildP17OrderNo = (p18OrderNo, itemNo) => {
   if (parts.length >= 5) {
     const shortRecipe = parts[1];
     const dateStr = parts[2];
-    const outputItem = parts[3];
-    const runIdStr = parts[4];
-       return `P17_${shortRecipe}_${dateStr}_${outputItem}_${itemNo}_${runIdStr}`;
+    const runIdStr = parts[parts.length - 1];
+    return `P17_${shortRecipe}_${dateStr}_${itemNo}_${runIdStr}`;
   }
 
   return `P17_${String(p18OrderNo).replace(/^P18_/, '')}_${itemNo}`;
