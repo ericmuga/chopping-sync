@@ -55,12 +55,14 @@ const resetFromTodaySyncData = async (pool) => {
       new sql.Request(transaction)
         .input('syncStartDate', sql.Date, syncStartDate);
 
+    // Only delete records that have not yet been sent to BC — preserve synced ones to avoid BC duplicates
     await request().query(`
       DELETE l
       FROM [dbo].[wms_production_line] l
       INNER JOIN [dbo].[wms_sync_batch] b
         ON l.batch_id = b.batch_id
-      WHERE b.batch_date >= @syncStartDate;
+      WHERE b.batch_date >= @syncStartDate
+        AND l.synced_to_bc_at IS NULL;
     `);
 
     await request().query(`
@@ -68,20 +70,29 @@ const resetFromTodaySyncData = async (pool) => {
       FROM [dbo].[wms_production_header] h
       INNER JOIN [dbo].[wms_sync_batch] b
         ON h.batch_id = b.batch_id
-      WHERE b.batch_date >= @syncStartDate;
+      WHERE b.batch_date >= @syncStartDate
+        AND h.synced_to_bc_at IS NULL;
     `);
 
+    // Only remove sync log entries for batches that are now empty
     await request().query(`
       DELETE s
       FROM [dbo].[wms_bc_sync_log] s
-      INNER JOIN [dbo].[wms_sync_batch] b
-        ON s.batch_id = b.batch_id
-      WHERE b.batch_date >= @syncStartDate;
+      WHERE s.batch_id IN (
+        SELECT b.batch_id
+        FROM [dbo].[wms_sync_batch] b
+        WHERE b.batch_date >= @syncStartDate
+          AND NOT EXISTS (SELECT 1 FROM [dbo].[wms_production_header] h WHERE h.batch_id = b.batch_id)
+          AND NOT EXISTS (SELECT 1 FROM [dbo].[wms_production_line] l WHERE l.batch_id = b.batch_id)
+      );
     `);
 
+    // Only delete batches that have no remaining headers or lines
     await request().query(`
       DELETE FROM [dbo].[wms_sync_batch]
-      WHERE batch_date >= @syncStartDate;
+      WHERE batch_date >= @syncStartDate
+        AND NOT EXISTS (SELECT 1 FROM [dbo].[wms_production_header] h WHERE h.batch_id = [wms_sync_batch].batch_id)
+        AND NOT EXISTS (SELECT 1 FROM [dbo].[wms_production_line] l WHERE l.batch_id = [wms_sync_batch].batch_id);
     `);
 
     const resetResult = await request().query(`
@@ -693,7 +704,22 @@ const getQualifiedP18GItems = async (pool, batchId) => {
         AND NOT EXISTS (
           SELECT 1
           FROM [dbo].[wms_production_header] h2
-          WHERE h2.production_order_no = CONCAT('P17_', REPLACE(q.production_order_no, 'P18_', ''), '_', q.item_no)
+          WHERE h2.production_order_no = CONCAT(
+            'P17_',
+            -- shortRecipe + '_' + dateStr (segments 2 and 3 of the P18 order no)
+            SUBSTRING(
+              q.production_order_no,
+              CHARINDEX('_', q.production_order_no) + 1,
+              CHARINDEX('_', q.production_order_no,
+                CHARINDEX('_', q.production_order_no,
+                  CHARINDEX('_', q.production_order_no) + 1
+                ) + 1
+              ) - CHARINDEX('_', q.production_order_no) - 1
+            ),
+            '_', q.item_no, '_',
+            -- last segment (runId) via reverse
+            REVERSE(LEFT(REVERSE(q.production_order_no), CHARINDEX('_', REVERSE(q.production_order_no)) - 1))
+          )
             AND h2.order_type = 'P17'
         )
       ORDER BY q.production_order_no, q.item_no;
