@@ -2,16 +2,17 @@
  * Daily chopping_lines prep
  *
  * Runs before each batching/sync cycle. Processes ALL CLOSED choppings from
- * @paramWorkDate onwards (default: config.sync.startDate).
+ * @paramWorkDate onwards (default: yesterday's midnight in GMT+3).
  * 
  * For each closed chopping, this:
  * - Reconstructs water/intake item lines from template_lines
  * - Updates existing water/intake lines with recalculated weights
  * - Inserts missing water/intake lines
  * - Removes duplicate lines
- * - Deletes and recreates ALL output lines with fresh calculations
+ * - Updates output weights in place and inserts missing output lines
+ * - Preserves timestamps on existing WMS lines
  * 
- * IMPORTANT: This retroactively fixes historical data from the start date forward.
+ * IMPORTANT: This fixes data from the rolling start date forward.
  * Only processes choppings where closed_by IS NOT NULL.
  */
 
@@ -132,15 +133,15 @@ CREATE CLUSTERED INDEX IX_WaterQuery_ChoppingItem ON #WaterQuery([chopping_id], 
 -- update existing item lines for the work date
 UPDATE target
 SET
-    target.[weight] = source.[weight],
-    target.[updated_at] = GETDATE()
+    target.[weight] = source.[weight]
 FROM [calibra].[dbo].[chopping_lines] AS target
 INNER JOIN #ClosedChoppings AS cc
     ON target.[chopping_id] = cc.[chopping_id]
 INNER JOIN #WaterQuery AS source
     ON target.[chopping_id] = source.[chopping_id]
    AND target.[item_code] = source.[item_code]
-WHERE target.[created_at] >= @WorkDate;
+WHERE target.[created_at] >= @WorkDate
+  AND (target.[weight] IS NULL OR target.[weight] <> source.[weight]);
 
 
 -- insert missing item lines for the work date
@@ -223,8 +224,9 @@ GROUP BY
 CREATE CLUSTERED INDEX IX_OutputItems_ChoppingItem ON #OutputItems([chopping_id], [chopping_date], [item_code]);
 
 
--- delete existing output lines for closed choppings before reinserting
-DELETE target
+-- Correct output weights in place; preserve original row IDs and timestamps.
+UPDATE target
+SET target.[weight] = source.[weight]
 FROM [calibra].[dbo].[chopping_lines] AS target
 INNER JOIN #ClosedChoppings AS cc
     ON target.[chopping_id] = cc.[chopping_id]
@@ -233,10 +235,11 @@ INNER JOIN #OutputItems AS source
    AND CAST(target.[created_at] AS date) = source.[chopping_date]
    AND target.[item_code] = source.[item_code]
 WHERE target.[created_at] >= @WorkDate
-  AND target.[output] = 1;
+  AND target.[output] = 1
+  AND (target.[weight] IS NULL OR target.[weight] <> source.[weight]);
 
 
--- insert output lines for closed choppings
+-- Only new output rows need timestamps; existing rows are never recreated.
 INSERT INTO [calibra].[dbo].[chopping_lines] (
     [chopping_id],
     [item_code],
@@ -256,13 +259,20 @@ SELECT
     GETDATE()
 FROM #OutputItems AS source
 INNER JOIN #ClosedChoppings AS cc
-    ON source.[chopping_id] = cc.[chopping_id];
+    ON source.[chopping_id] = cc.[chopping_id]
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM [calibra].[dbo].[chopping_lines] AS target WITH (UPDLOCK, HOLDLOCK)
+    WHERE target.[chopping_id] = source.[chopping_id]
+      AND CAST(target.[created_at] AS date) = source.[chopping_date]
+      AND target.[item_code] = source.[item_code]
+      AND target.[output] = 1
+);
 `;
 
 export const prepChoppingLines = async (pool, workDate = null) => {
-  // Default: config.sync.startDate — processes and amends ALL closed choppings
-  // from the configured start date onwards. This retroactively fixes historical
-  // data each run. Caller can pass an explicit date to override.
+  // Default: yesterday's WMS calendar date, recalculated on each invocation.
+  // Caller can pass an explicit date to keep all stages of a cycle consistent.
   let date;
   if (workDate) {
     date = workDate instanceof Date ? workDate : new Date(workDate);

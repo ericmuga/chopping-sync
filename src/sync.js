@@ -14,11 +14,12 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 import { connectWms, sql } from './db.js';
 import { prepChoppingLines } from './prep.js';
+import { ensureOrderNumberRegistry, getProductionOrderNo } from './orderNumbers.js';
 import {
   mapItemCode,
   getLocationCode,
   getRecipePrefix,
-  buildProductionOrderNo,
+  buildLegacyProductionOrderNo,
   loadItemMappings,
   loadItemLocations,
 } from './helpers.js';
@@ -36,11 +37,9 @@ const toSqlDateString = (value) => {
  */
 
 /**
- * Reset generated sync data from configured sync start date onward.
- * This allows full rebuilds by only changing .env and restarting.
+ * Reset generated sync data from yesterday's midnight in GMT+3 onward.
  */
-const resetFromTodaySyncData = async (pool) => {
-  const syncStartDate = config.sync.startDate;
+const resetFromTodaySyncData = async (pool, syncStartDate) => {
 
   logger.warn(
     `Resetting sync data from ${syncStartDate} onward before rerun...`
@@ -135,10 +134,8 @@ const resetFromTodaySyncData = async (pool) => {
  * Get closed choppings that need processing.
  * Normal mode: only sync_id IS NULL.
  */
-const getChoppingsToProcess = async (pool) => {
+const getChoppingsToProcess = async (pool, syncStartDate) => {
   logger.info('Getting choppings to process...');
-
-  const syncStartDate = config.sync.startDate;
 
   const result = await pool.request()
     .input('syncStartDate', sql.Date, syncStartDate)
@@ -330,21 +327,35 @@ const createBatch = async (pool, productionDate, productionHour, choppingRowId) 
   }
 };
 
-const buildProductionOrders = (outputs, productionDate, choppingRowId) => {
+const buildProductionOrders = async (pool, outputs, productionDate, choppingRowId) => {
   const prodDateStr = toSqlDateString(productionDate);
 
-  return outputs.map((output) => ({
-    recipePrefix: output.recipePrefix,
-    productionDate: prodDateStr,
-    outputItem: output.itemCode,
-    outputWeight: output.totalWeight,
-    productionOrderNo: buildProductionOrderNo(
-      output.recipePrefix,
-      output.itemCode,
-      prodDateStr,
-      choppingRowId
-    ),
-  }));
+  const orders = [];
+  for (const output of outputs) {
+    // Existing orders may already be in BC under the old number. Do not recreate
+    // them with a new identity; existing staging rows remain transferable as-is.
+    const legacyNo = buildLegacyProductionOrderNo(
+      output.recipePrefix, output.itemCode, prodDateStr, choppingRowId
+    );
+    const existing = await pool.request()
+      .input('legacyNo', sql.NVarChar, legacyNo)
+      .query('SELECT 1 FROM dbo.wms_production_header WHERE production_order_no = @legacyNo;');
+    if (existing.recordset.length) {
+      logger.info(`Preserving existing legacy order ${legacyNo}`);
+      continue;
+    }
+    orders.push({
+      recipePrefix: output.recipePrefix,
+      productionDate: prodDateStr,
+      outputItem: output.itemCode,
+      outputWeight: output.totalWeight,
+      productionOrderNo: await getProductionOrderNo(pool, 'P18', [
+        String(choppingRowId), output.recipePrefix, prodDateStr, output.itemCode,
+      ]),
+    });
+  }
+  return orders;
+
 };
 
 const insertProductionHeaders = async (pool, orders, batchId) => {
@@ -591,19 +602,6 @@ const insertProductionLines = async (pool, orders, inputs, batchId) => {
   return { outputLines, inputLines };
 };
 
-const buildP17OrderNo = (p18OrderNo, itemNo) => {
-  const parts = String(p18OrderNo).split('_');
-
-  if (parts.length >= 5) {
-    const shortRecipe = parts[1];
-    const dateStr = parts[2];
-    const runIdStr = parts[parts.length - 1];
-    return `P17_${shortRecipe}_${dateStr}_${itemNo}_${runIdStr}`;
-  }
-
-  return `P17_${String(p18OrderNo).replace(/^P18_/, '')}_${itemNo}`;
-};
-
 const getSpicePremixRecipe = async (pool, itemCode) => {
   if (!String(itemCode).startsWith('G')) return null;
 
@@ -701,27 +699,6 @@ const getQualifiedP18GItems = async (pool, batchId) => {
         q.output_item_location
       FROM QualifiedRecipes q
       WHERE q.recipe_count = 1
-        AND NOT EXISTS (
-          SELECT 1
-          FROM [dbo].[wms_production_header] h2
-          WHERE h2.production_order_no = CONCAT(
-            'P17_',
-            -- shortRecipe + '_' + dateStr (segments 2 and 3 of the P18 order no)
-            SUBSTRING(
-              q.production_order_no,
-              CHARINDEX('_', q.production_order_no) + 1,
-              CHARINDEX('_', q.production_order_no,
-                CHARINDEX('_', q.production_order_no,
-                  CHARINDEX('_', q.production_order_no) + 1
-                ) + 1
-              ) - CHARINDEX('_', q.production_order_no) - 1
-            ),
-            '_', q.item_no, '_',
-            -- last segment (runId) via reverse
-            REVERSE(LEFT(REVERSE(q.production_order_no), CHARINDEX('_', REVERSE(q.production_order_no)) - 1))
-          )
-            AND h2.order_type = 'P17'
-        )
       ORDER BY q.production_order_no, q.item_no;
     `);
 
@@ -738,7 +715,7 @@ const generateP17Orders = async (pool, batchId) => {
   logger.info(`Qualifying P18 G-items for P17: ${qualifyingRows.length}`);
 
   for (const row of qualifyingRows) {
-    const p17OrderNo = buildP17OrderNo(row.production_order_no, row.item_no);
+    const p17OrderNo = await getProductionOrderNo(pool, 'P17', [row.production_order_no, row.item_no]);
 
     try {
       const recipe = await getSpicePremixRecipe(pool, row.item_no);
@@ -980,12 +957,12 @@ const markChoppingsAsSynced = async (pool, choppings, batchId) => {
   return rowsAffected;
 };
 
-const processPendingSync = async (pool) => {
-  await prepChoppingLines(pool);
+const processPendingSync = async (pool, syncStartDate) => {
+  await prepChoppingLines(pool, syncStartDate);
   await loadItemMappings(pool);
   await loadItemLocations(pool);
 
-  const choppingsToProcess = await getChoppingsToProcess(pool);
+  const choppingsToProcess = await getChoppingsToProcess(pool, syncStartDate);
 
   for (const chopping of choppingsToProcess) {
     logger.info(
@@ -999,13 +976,15 @@ const processPendingSync = async (pool) => {
       continue;
     }
 
+    const orders = await buildProductionOrders(pool, outputs, chopping.production_date, chopping.chopping_row_id);
+    if (!orders.length) continue;
+
     const { batchId } = await createBatch(
       pool,
       chopping.production_date,
       chopping.production_hour,
       chopping.chopping_row_id
     );
-    const orders = buildProductionOrders(outputs, chopping.production_date, chopping.chopping_row_id);
 
     const headersInserted = await insertProductionHeaders(pool, orders, batchId);
     const { outputLines, inputLines } = await insertProductionLines(pool, orders, inputs, batchId);
@@ -1027,13 +1006,16 @@ const processPendingSync = async (pool) => {
  * Processes only choppings where sync_id IS NULL.
  */
 export const runSync = async () => {
+  // Capture once so every stage uses the same date, even across WMS midnight.
+  const syncStartDate = config.sync.startDate;
   const pool = await connectWms();
 
   try {
-    // Rebuild and rerun from today onward
-    await resetFromTodaySyncData(pool);
+    await ensureOrderNumberRegistry(pool);
+    // Rebuild and rerun from yesterday's midnight in GMT+3 onward.
+    await resetFromTodaySyncData(pool, syncStartDate);
 
-    return await processPendingSync(pool);
+    return await processPendingSync(pool, syncStartDate);
   } catch (err) {
     logger.error('Error during sync:', err);
     return { success: false, error: err };

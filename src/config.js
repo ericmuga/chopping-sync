@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { getYesterdayWmsDate } from './dates.js';
 
 const parseBatchCycleMinutes = () => {
   const minutesRaw = process.env.BATCH_CYCLE_MINUTES;
@@ -28,7 +29,7 @@ export const config = {
     pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
   },
   sync: {
-    startDate: process.env.SYNC_START_DATE || '2026-04-14',
+    get startDate() { return getYesterdayWmsDate(); },
     batchCycleMinutes: parseBatchCycleMinutes(),
     defaultLocationCode: process.env.DEFAULT_LOCATION_CODE || '2055',
   },

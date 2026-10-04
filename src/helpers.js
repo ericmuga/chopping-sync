@@ -56,10 +56,10 @@ export const formatDateYYMMDD = (date) => {
 };
 
 /**
- * Build production order number
+ * Build the previous production order number for migration/deduplication only.
  * Format: P18_3K31_260414_G2159_333787
  */
-export const buildProductionOrderNo = (recipePrefix, outputItem, productionDate, choppingRowId) => {
+export const buildLegacyProductionOrderNo = (recipePrefix, outputItem, productionDate, choppingRowId) => {
   const shortRecipe = getShortRecipeCode(recipePrefix);
   const dateStr = formatDateYYMMDD(productionDate);
   const runIdStr = String(choppingRowId);
