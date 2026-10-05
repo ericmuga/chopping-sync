@@ -100,10 +100,10 @@ npm run service:uninstall
 
 Production order numbers use the original format
 `P18_<short recipe>_<YYMMDD>_<output item>_<chopping row ID>`, restricted to its
-first 20 characters. P17 uses the same recipe/date segments with the premix output
-item and is also restricted to 20 characters. The date segment contains no time
+first 30 characters. P17 uses the same recipe/date segments with the premix output
+item and is also restricted to 30 characters. The date segment contains no time
 of day, as in the original format. Truncation may cut the output item and removes
-the row ID for typical recipes, so different orders can have the same number.
+all or part of the row ID in longer names, so different orders can have the same number.
 The registry is no longer used; existing database records are not renamed.
 
 Prep preserves `created_at` and `updated_at` on existing WMS chopping lines.

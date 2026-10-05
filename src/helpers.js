@@ -56,14 +56,14 @@ export const formatDateYYMMDD = (date) => {
 };
 
 /**
- * Original format, limited to its first 20 characters.
+ * Original format, limited to its first 30 characters.
  * Truncation can remove the row ID and therefore does not guarantee uniqueness.
  */
 export const buildProductionOrderNo = (recipePrefix, outputItem, productionDate, choppingRowId) => {
   const shortRecipe = getShortRecipeCode(recipePrefix);
   const dateStr = formatDateYYMMDD(productionDate);
   const runIdStr = String(choppingRowId);
-  return `P18_${shortRecipe}_${dateStr}_${outputItem}_${runIdStr}`.slice(0, 20);
+  return `P18_${shortRecipe}_${dateStr}_${outputItem}_${runIdStr}`.slice(0, 30);
 };
 
 export const buildP17OrderNo = (p18OrderNo, itemNo) => {
@@ -71,7 +71,7 @@ export const buildP17OrderNo = (p18OrderNo, itemNo) => {
   if (parts[0] !== 'P18' || !parts[1] || !/^\d{6}$/.test(parts[2] || '')) {
     throw new Error(`Cannot derive recipe/date from P18 order ${p18OrderNo}`);
   }
-  return `P17_${parts[1]}_${parts[2]}_${itemNo}_${parts[4] || ''}`.slice(0, 20);
+  return `P17_${parts[1]}_${parts[2]}_${itemNo}_${parts[4] || ''}`.slice(0, 30);
 };
 
 /**
