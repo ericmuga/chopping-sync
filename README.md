@@ -91,22 +91,20 @@ npm run service:uninstall
 | `WMS_DB_NAME` | calibra | Database name |
 | `WMS_DB_USER` | - | SQL username |
 | `WMS_DB_PASSWORD` | - | SQL password |
-| `SYNC_START_DATE` | Ignored | Each cycle processes from yesterday at 00:00 in GMT+3 onward |
+| `SYNC_START_DATE` | Ignored | Processes from 3 October 2026 at 00:00 WMS time onward |
 | `BATCH_CYCLE_MINUTES` | 5 | Run interval (minutes). If not set, falls back to `BATCH_CYCLE_HOURS * 60` |
 | `DEFAULT_LOCATION_CODE` | 2055 | Default location |
 | `LOG_LEVEL` | info | debug/info/warn/error |
 
 ## Item Code Mapping
 
-New P18 and P17 production orders use their type followed by a unique registry ID
-encoded in base 36 (for example, `P181` or `P172`). Numbers use at most 16 characters,
-within BC's 20-character limit. The persistent `dbo.wms_order_number_registry`
-table is created automatically on first sync; the database account needs table
-creation permission for that first run. Keep and back up this table: reruns reuse
-the same numbers, including after staging records are rebuilt.
-
-Existing orders retained under the previous format keep their original numbers
-to avoid creating duplicates in BC. This change does not rename orders already sent.
+Production order numbers use the original format
+`P18_<short recipe>_<YYMMDD>_<output item>_<chopping row ID>`, restricted to its
+first 20 characters. P17 uses the same recipe/date segments with the premix output
+item and is also restricted to 20 characters. The date segment contains no time
+of day, as in the original format. Truncation may cut the output item and removes
+the row ID for typical recipes, so different orders can have the same number.
+The registry is no longer used; existing database records are not renamed.
 
 Prep preserves `created_at` and `updated_at` on existing WMS chopping lines.
 It updates changed weights in place and inserts missing outputs rather than

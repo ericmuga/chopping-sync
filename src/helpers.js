@@ -56,14 +56,22 @@ export const formatDateYYMMDD = (date) => {
 };
 
 /**
- * Build the previous production order number for migration/deduplication only.
- * Format: P18_3K31_260414_G2159_333787
+ * Original format, limited to its first 20 characters.
+ * Truncation can remove the row ID and therefore does not guarantee uniqueness.
  */
-export const buildLegacyProductionOrderNo = (recipePrefix, outputItem, productionDate, choppingRowId) => {
+export const buildProductionOrderNo = (recipePrefix, outputItem, productionDate, choppingRowId) => {
   const shortRecipe = getShortRecipeCode(recipePrefix);
   const dateStr = formatDateYYMMDD(productionDate);
   const runIdStr = String(choppingRowId);
-  return `P18_${shortRecipe}_${dateStr}_${outputItem}_${runIdStr}`;
+  return `P18_${shortRecipe}_${dateStr}_${outputItem}_${runIdStr}`.slice(0, 20);
+};
+
+export const buildP17OrderNo = (p18OrderNo, itemNo) => {
+  const parts = String(p18OrderNo).split('_');
+  if (parts[0] !== 'P18' || !parts[1] || !/^\d{6}$/.test(parts[2] || '')) {
+    throw new Error(`Cannot derive recipe/date from P18 order ${p18OrderNo}`);
+  }
+  return `P17_${parts[1]}_${parts[2]}_${itemNo}_${parts[4] || ''}`.slice(0, 20);
 };
 
 /**

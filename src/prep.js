@@ -2,7 +2,7 @@
  * Daily chopping_lines prep
  *
  * Runs before each batching/sync cycle. Processes ALL CLOSED choppings from
- * @paramWorkDate onwards (default: yesterday's midnight in GMT+3).
+ * @paramWorkDate onwards (default: 3 October 2026 midnight in WMS time).
  * 
  * For each closed chopping, this:
  * - Reconstructs water/intake item lines from template_lines
@@ -12,7 +12,7 @@
  * - Updates output weights in place and inserts missing output lines
  * - Preserves timestamps on existing WMS lines
  * 
- * IMPORTANT: This fixes data from the rolling start date forward.
+ * IMPORTANT: This fixes data from the configured start date forward.
  * Only processes choppings where closed_by IS NOT NULL.
  */
 
@@ -271,7 +271,7 @@ WHERE NOT EXISTS (
 `;
 
 export const prepChoppingLines = async (pool, workDate = null) => {
-  // Default: yesterday's WMS calendar date, recalculated on each invocation.
+  // Default: configured WMS start date (3 October 2026).
   // Caller can pass an explicit date to keep all stages of a cycle consistent.
   let date;
   if (workDate) {
